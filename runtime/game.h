@@ -28,9 +28,18 @@ typedef struct {
                                    // USERNAME, SystemRoot... in the virtual C:); 0: only DXVK_/MESA_/VKD3D_ host variables
     int win32_cursors;             // SetCursor changes the on-screen cursor (custom cursors from CreateIconIndirect,
                                    // SetCursor(NULL) hides it), and mouse moves send WM_SETCURSOR, as on Windows (UE4)
+    // When the Steam layer runs offline (no Steam client, or <PREFIX>_STEAM_OFFLINE):
+    int steam_offline_logged_off;  // ISteamUser::BLoggedOn reports false, as Steam in offline mode does; 0: true, so the
+                                   // game tries its online sign-in and waits for the ticket requests to fail
+    int offline_no_http;           // WinHttpCheckPlatform reports WinHTTP unavailable, so the game makes no web
+                                   // requests (telemetry, online config). Needs the check to come after SteamAPI_Init,
+                                   // unless offline is forced by <PREFIX>_STEAM_OFFLINE.
 } RtGame;
 
 extern const RtGame rt_game;
 
 // getenv("<env_prefix>_<name>")
 const char *rt_game_env(const char *name);
+// The Steam layer runs offline: forced by <PREFIX>_STEAM_OFFLINE, or SteamAPI_Init found no Steam client
+// (0 before SteamAPI_Init, unless forced).
+int rt_steam_offline(void);
