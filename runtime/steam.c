@@ -8,7 +8,8 @@
 // SteamAPI_RunCallbacks fires the twins, which convert the struct (macOS SDK structs are packed to 4,
 // Windows ones to 8) and call the game's handler.
 // Offline (no client or no library): SteamAPI_Init still succeeds, the user is "Player", and async calls
-// complete with k_EResultNoConnection after a delay.
+// complete with k_EResultNoConnection after a delay. BLoggedOn reports true, or false with
+// rt_game.steam_offline_logged_off.
 // Slots not implemented log once and return 0.
 #include "rt.h"
 #include <dlfcn.h>
@@ -178,7 +179,7 @@ void steam_register_pending(void);
 static void ret_true(CPU *c, int i, int s) { RET(1); }
 // ISteamUser018: 1 BLoggedOn, 2 GetSteamID, 13 GetAuthSessionTicket, 16 CancelAuthTicket,
 // 20 RequestEncryptedAppTicket, 21 GetEncryptedAppTicket, 23 GetPlayerSteamLevel
-static void u_BLoggedOn(CPU *c, int i, int s) { RET(S.online ? S.BLoggedOn(S.user) : 1); }
+static void u_BLoggedOn(CPU *c, int i, int s) { RET(S.online ? S.BLoggedOn(S.user) : !rt_game.steam_offline_logged_off); }
 // CSteamID is returned through a hidden pointer (rdx) under the MSVC ABI
 static void u_GetSteamID(CPU *c, int i, int s) { wr64(A1, S.online ? S.GetSteamID(S.user) : 0x0110000100000001ull); RET(A1); }
 // GetAuthSessionTicket(ticket, cbMax, *pcbTicket) -> HAuthTicket
@@ -644,9 +645,12 @@ static void cloud_start(void) {
     pthread_t t; pthread_create(&t, NULL, cloud_thread, NULL); pthread_detach(t);
 }
 
+static int steam_init_done;
+int rt_steam_offline(void) { return app_id && (rt_game_env("STEAM_OFFLINE") || (steam_init_done && !S.online)); }
 void I_steam_api64_dll_SteamAPI_Init(CPU *c) {
     if (!app_id) { rt_log("[steam] SteamAPI_Init -> false (no Steam app ID in game.c: the game runs as if Steam were not installed)\n"); RET(0); return; }
     S.online = steam_connect();
+    steam_init_done = 1;
     if (S.online) steam_register_pending();
     if (S.online) cloud_start();
     if (S.online) rt_log("[steam] SteamAPI_Init: online as \"%s\" (Steam ID %llu, logged on %d)\n", S.GetPersonaName(S.friends),
