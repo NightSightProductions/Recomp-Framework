@@ -36,8 +36,11 @@ EXTRA_LIBS_FORCE ?=
 FW_INC     = -I$(FW)/runtime -I$(FW)/third_party/vulkan/include
 WARN       = -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-label
 CFLAGS    ?= -O1 -g $(ARCH) -mmacosx-version-min=$(MACOS_MIN) $(WARN) $(FW_INC)
-# translated code: -O2 so clang's loop vectorizer turns per-lane XMM loops back into NEON
-GEN_CFLAGS ?= -O2 -g $(ARCH) -mmacosx-version-min=$(MACOS_MIN) $(WARN) -I$(FW)/runtime
+# translated code: -O2 so clang's loop vectorizer turns per-lane XMM loops back into NEON.
+# Conditional jumps come out as `if ((sf==of))` (the condition table keeps each condition parenthesized for use
+# inside other expressions); clang flags every one with -Wparentheses-equality, about 20,000 lines per build.
+GEN_WARN   = $(WARN) -Wno-parentheses-equality
+GEN_CFLAGS ?= -O2 -g $(ARCH) -mmacosx-version-min=$(MACOS_MIN) $(GEN_WARN) -I$(FW)/runtime
 
 # ---- profile-guided optimization ----
 #   make app PGO=gen BUILD=build-pgo   instrumented build; play it (each run writes $(PGO_DIR)/*.profraw on exit)
