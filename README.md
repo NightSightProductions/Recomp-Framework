@@ -229,6 +229,7 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
 | `RT_VK_DUMP=dir` | Shaders, pipelines and per-frame snapshots (F9), including indirect-draw arguments read back from the GPU; F10 hides pipelines one at a time |
 | `RT_VK_REPLACE=dir` | Replace shaders by hash with custom SPIR-V |
 | `RT_FPS`, `RT_SCREENSHOT=n` with `RT_SCREENSHOT_FILE` | Frame-rate log; capture of frame *n* |
+| `RT_MAX_FPS=n` | Frame cap for Vulkan games (default 60, `0` = uncapped): presents are spaced at least 1/n s apart in every vsync mode |
 | `RT_GPU_CAPTURE=seconds[:path]` | Metal GPU capture (`.gputrace`, opens in Xcode) of one frame presented that many seconds after launch |
 | `RT_HTTP_TRACE`, `RT_QUERY_STATS`, `RT_YIELD_STATS`, `RT_VK_FORMATS`, `RT_LIST_MODES` | Subsystem traces |
 | `RT_GL_CHECK=1`, `RT_GL_SHADERS=dir`, `RT_GL_SCREENSHOT=n` with `RT_GL_SCREENSHOT_FILE` | OpenGL games: `glGetError` after every call (logged once per function and error), shader dumps, capture of frame *n* |
