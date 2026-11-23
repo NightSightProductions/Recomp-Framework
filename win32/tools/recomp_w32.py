@@ -13,6 +13,8 @@ codegen are carried over, with the i386 differences:
   - x87 compares set the status word (C.fsw) for the fnstsw ax / sahf / test ah idioms of 32-bit MSVC code.
 
 usage: recomp_w32.py ORIG.exe OUTDIR [--native FILE] [--patches FILE] [--probes FILE] [--only ADDR,...]
+  --patches FILE: lines "ADDR C code" replace the instruction at ADDR with C; "ADDR @call N_name" turns it into a
+  call to the host native N_name (which reads ARG(i) and pops its own arguments, like an import shim)
                                      [--no-abi-trim] [--jobs N]
 """
 import os, re, sys, collections, multiprocessing as mp, struct
@@ -71,7 +73,7 @@ _XMM_RE = re.compile(r"\bC\.xmm\[(\d+)\]")
 _ASSIGN = r"\s*(?:[-+*/&|^%]|<<|>>)?=(?!=)"
 _GPR_W = re.compile(r"\bR_(\w+)(?:%s|\s*(?:\+\+|--))" % _ASSIGN)
 _XMM_W = re.compile(r"\bX_(\d+)(?:\.\w+(?:\[[^\]]*\])?)?%s" % _ASSIGN)
-_BARRIER = re.compile(r"\b(F_[0-9a-f]+|I_\w+|call_ind|missing_func|bad_insn|bad_jump|cpu_cpuid|unimpl_import|cpu_int)"
+_BARRIER = re.compile(r"\b(F_[0-9a-f]+|I_\w+|N_\w+|call_ind|missing_func|bad_insn|bad_jump|cpu_cpuid|unimpl_import|cpu_int)"
                       r"\(c(?:,(?:\"(?:[^\"\\]|\\.)*\"|[^;\"])*)?\);")
 _RETURN = re.compile(r"\breturn;")
 # i386 C ABI (cdecl/stdcall/thiscall/fastcall): ebx, ebp, esi, edi survive a call; eax, ecx, edx and every xmm
@@ -391,7 +393,11 @@ class FuncGen:
             try:
                 for pc in PROBES.get(i.address, ()): self.e("{ void rt_log(const char *, ...); " + pc + " }   /* probe */")
                 n0 = len(self.out)
-                if i.address in PATCHES: self.e(PATCHES[i.address] + "   /* patched: %s %s */" % (i.mnemonic, i.op_str))
+                if i.address in PATCHES and PATCHES[i.address].startswith("@call "):
+                    # the instruction becomes a call to a host native N_* that sees the guest stack the original
+                    # callee would (arguments already pushed; it pops them itself, like an import shim)
+                    self.e("PUSH(c, 0x%xu); %s(c); C.esp += 4;   /* patched: %s %s */" % (i.address + i.size, PATCHES[i.address].split()[1], i.mnemonic, i.op_str))
+                elif i.address in PATCHES: self.e(PATCHES[i.address] + "   /* patched: %s %s */" % (i.mnemonic, i.op_str))
                 else: self.insn(i)
                 # tag the C with the guest address (debugger file:line -> guest instruction)
                 for k in range(n0, len(self.out)): self.out[k] += " /*@%x*/" % i.address
@@ -1116,16 +1122,21 @@ class FuncGen:
             if len(ops) == 2:
                 d, s_ = st(ops[0]), st(ops[1])
                 e("{ double a = %s, b = %s; %s = %s;%s }" % (d, s_, d, ar[op], " FPOP(c);" if pop else "")); return True
-            if len(ops) == 1:   # faddp st(i): st(i) = st(i) op st(0), pop
+            if len(ops) == 1:
+                # capstone prints both register forms with one operand: the popping ones (DE: faddp st(i)) are
+                # st(i) = st(i) op st(0), pop; the plain ones (D8: fadd st(i)) are st(0) = st(0) op st(i)
                 d = st(ops[0])
-                e("{ double a = %s, b = ST(0); %s = %s;%s }" % (d, d, ar[op], " FPOP(c);" if pop else "")); return True
+                if pop: e("{ double a = %s, b = ST(0); %s = %s; FPOP(c); }" % (d, d, ar[op]))
+                else: e("{ double a = ST(0), b = %s; ST(0) = %s; }" % (d, ar[op]))
+                return True
             if not ops and pop:
                 e("{ double a = ST(1), b = ST(0); ST(1) = %s; FPOP(c); }" % ar[op]); return True
         un = {"fchs": "-ST(0)", "fabs": "fabs(ST(0))", "fsqrt": "sqrt(ST(0))", "fsin": "sin(ST(0))", "fcos": "cos(ST(0))",
               "frndint": "fpu_round(c, ST(0))", "f2xm1": "exp2(ST(0)) - 1.0"}
         if m in un: e("ST(0) = %s;" % un[m]); return True
-        if m == "fxch":
-            o = st(ops[0]) if ops else "ST(1)"
+        if m == "fxch":   # capstone may list the implicit st(0) first: the register exchanged is the last operand
+            o = st(ops[-1]) if ops else "ST(1)"
+            if o == "ST(0)": o = "ST(1)" if len(ops) < 2 else o
             e("{ double t = ST(0); ST(0) = %s; %s = t; }" % (o, o)); return True
         if m == "fpatan": e("{ double v = atan2(ST(1), ST(0)); FPOP(c); ST(0) = v; }"); return True
         if m == "fptan": e("ST(0) = tan(ST(0)); FPUSH(c, 1.0);"); return True
@@ -1136,9 +1147,10 @@ class FuncGen:
         if m in ("fprem", "fprem1"):
             e("{ double r = %s(ST(0), ST(1)); ST(0) = r; C.fsw &= ~0x0400u; }" % ("fmod" if m == "fprem" else "remainder")); return True
         if m == "fxtract": e("{ int ex; double mnt = frexp(ST(0), &ex); ST(0) = (double)(ex - 1); FPUSH(c, mnt * 2.0); }"); return True
+        if m in ("fucompi", "fcompi"): m = m[:-2] + "ip"   # capstone's spelling of fcomip / fucomip
         if m in ("fucomip", "fcomip", "fucomi", "fcomi"):
             e("{ double a = ST(0), b = %s; if (a != a || b != b) { zf = cf = 1; pr = 0; } else { zf = a == b; cf = a < b; pr = 1; } of = sf = 0;%s }"
-              % (st(ops[1]) if len(ops) > 1 else "ST(1)", " FPOP(c);" if m.endswith("p") else "")); return True
+              % (st(ops[-1]) if ops and st(ops[-1]) != "ST(0)" else "ST(1)", " FPOP(c);" if m.endswith("p") else "")); return True
         mc = re.match(r"f(i?)u?com(p{0,2})$", m)
         if mc:
             isint, pops = mc.groups()
@@ -1159,7 +1171,7 @@ class FuncGen:
         if m == "fstp" and not ops: e("FPOP(c);"); return True
         if m in ("fincstp",): e("c->top = (c->top + 1) & 7;"); return True
         if m in ("fdecstp",): e("c->top = (c->top - 1) & 7;"); return True
-        if m in ("ffree", "ffreep", "fnop"):
+        if m in ("ffree", "ffreep", "fnop", "fdisi8087_nop", "feni8087_nop", "fsetpm287_nop"):
             if m == "ffreep": e("FPOP(c);")
             return True
         raise Unsupported(m)
@@ -1286,11 +1298,12 @@ def _work(chunk):
     for a in chunk:
         if a in NATIVE:
             try:
-                orig = FuncGen(TR, a).gen().replace("void F_%x(CPU *c) {" % a, "static void F_%x__orig(CPU *c) {" % a, 1)
+                orig = FuncGen(TR, a).gen().replace("void F_%x(CPU *c) {" % a, "void F_%x__orig(CPU *c) {" % a, 1)
             except Exception:
-                orig = "static void F_%x__orig(CPU *c) { bad_insn(c, 0x%xu, \"no translation\"); }" % (a, a)
+                orig = "void F_%x__orig(CPU *c) { bad_insn(c, 0x%xu, \"no translation\"); }" % (a, a)
             # the native body reads stack arguments from c and sets eax; the wrapper does the guest's plain `ret`
-            # (callee-cleanup natives pop their own arguments, see rt32.h RET_ARGS)
+            # (callee-cleanup natives pop their own arguments, see rt32.h NATIVE_POP); F_<addr>__orig stays callable
+            # (rt32.h CALL_ORIG) so a native can wrap the original
             out.append("void %s(CPU *c);\nint rt_native_enabled(uint32_t a);\n%s\nvoid F_%x(CPU *c) { static int on = -1; if (on < 0) on = rt_native_enabled(0x%xu);"
                        " if (on) { %s(c); c->esp += 4; } else F_%x__orig(c); }" % (NATIVE[a], orig, a, a, NATIVE[a], a))
             continue
@@ -1352,6 +1365,7 @@ def main():
     pe = TR.pe
     allimp = sorted(set(pe.iat.values()), key=imp_sym)
     write_if_changed(os.path.join(outdir, "funcs.h"), "#pragma once\n" + "".join("void F_%x(CPU *c);\n" % a for a in TR.funcs_list)
+                     + "".join("void %s(CPU *c);\n" % n for n in sorted({v.split()[1] for v in PATCHES.values() if v.startswith("@call ")}))
                      + "".join("void I_%s(CPU *c);\n" % imp_sym(n) for n in allimp))
     t = []
     t.append('#include "cpu32.h"\n#include "tables32.h"\n#include "funcs.h"\n')

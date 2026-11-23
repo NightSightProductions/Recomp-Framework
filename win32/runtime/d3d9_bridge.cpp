@@ -63,11 +63,6 @@ uint32_t buffer_info(Wrap *w);
 uint32_t wrap(void *host, char k) {
     if (!host) return 0;
     std::lock_guard<std::mutex> l(g_mu);
-    auto it = g_wraps.find(host);
-    if (it != g_wraps.end()) {
-        // the host counted a new reference; the wrapper forwards AddRef/Release, so nothing else to do
-        return it->second->base.guest;
-    }
     if (k == 'b' || k == 'r') {   // base texture / resource: pick the interface from the resource type
         auto *r = static_cast<IDirect3DResource9 *>(host);
         switch (r->GetType()) {
@@ -80,6 +75,14 @@ uint32_t wrap(void *host, char k) {
         case D3DRTYPE_VOLUME: k = 'v'; break;
         default: k = 'T'; break;
         }
+    }
+    auto it = g_wraps.find(host);
+    if (it != g_wraps.end()) {
+        // Same object: the host counted a new reference and the wrapper forwards AddRef/Release. A wrapper of another
+        // interface type is stale: DXVK's texture subresources (surfaces, volumes) never report 0 on Release, so their
+        // wrappers outlive them, and a new object of another type can land at the same address.
+        if (it->second->cls == k) return it->second->base.guest;
+        g_wraps.erase(it);
     }
     Wrap *w = new Wrap();
     w->host = static_cast<IUnknown *>(host);
@@ -124,12 +127,34 @@ void pp_out(const D3DPRESENT_PARAMETERS *h, uint32_t g) {
 
 int g_trace = -1;
 
+// RT_DUMP_SHADERS=1: write every shader's bytecode (up to the end token) to <data dir>/shaders/{vs,ps}_<fnv>.bin
+void dump_shader(const char *kind, uint32_t g) {
+    static int on = -1;
+    if (on < 0) on = getenv("RT_DUMP_SHADERS") != NULL;
+    if (!on || !g) return;
+    const uint32_t *t = (const uint32_t *)gp(g);
+    uint32_t n = 1;
+    while (n < (1u << 20) && t[n] != 0x0000FFFFu) {
+        uint32_t op = t[n] & 0xFFFF;
+        if (op == 0xFFFE) n += 1 + (t[n] >> 16);          // comment
+        else n += 1 + ((t[n] >> 24) & 0xF);               // SM2+: instruction length in bits 24-27
+    }
+    n++;
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n * 4; i++) h = (h ^ ((const uint8_t *)t)[i]) * 16777619u;
+    char d[1200], f[1300];
+    snprintf(d, sizeof d, "%s/shaders", rt_data_dir); mkdir(d, 0755);
+    snprintf(f, sizeof f, "%s/%s_%08x.bin", d, kind, h);
+    if (FILE *o = fopen(f, "wb")) { fwrite(t, 4, n, o); fclose(o); }
+}
+
 uint32_t forward(CPU *c, ComObj *self, const ComMethod *m) {
     Wrap *w = reinterpret_cast<Wrap *>(self);
     U a[12] = {0};
     void *outs[4] = {0}; uint32_t out_guest[4]; char out_cls[4]; int nout = 0;
     D3DPRESENT_PARAMETERS pps[2]; uint32_t pp_guest[2]; int npp = 0;
     int ai = 0, slot = 1;
+    if (m->vidx == 91 || m->vidx == 106) dump_shader(m->vidx == 91 ? "vs" : "ps", M(1));
     for (const char *s = m->sig; *s; s++, slot++) {
         uint32_t v = M(slot);
         switch (*s) {
@@ -152,6 +177,17 @@ uint32_t forward(CPU *c, ComObj *self, const ComMethod *m) {
     }
     uint32_t r = reinterpret_cast<Fn12>(vfn(w->host, m->vidx))(w->host, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
     for (int k = 0; k < nout; k++) wr32(out_guest[k], wrap(outs[k], out_cls[k]));
+    // failures are always worth a line (queries' "not ready" S_FALSE and D3DERR_NOTAVAILABLE probes are not failures)
+    if ((int32_t)r < 0 && r != 0x8876086Au && strcmp(m->name, "GetData") && strcmp(m->name, "TestCooperativeLevel")) {
+        rt_log("[d3d9] %s failed: 0x%08x", m->name, r);
+        for (int k = 0; k < npp; k++) {
+            const D3DPRESENT_PARAMETERS &q = pps[k];
+            rt_log("[d3d9]   present params: %ux%u fmt %u x%u ms %u swap %u hwnd %p windowed %d depth %d/%u flags 0x%x refresh %u interval 0x%x",
+                   q.BackBufferWidth, q.BackBufferHeight, q.BackBufferFormat, q.BackBufferCount, q.MultiSampleType, q.SwapEffect,
+                   (void *)q.hDeviceWindow, q.Windowed, q.EnableAutoDepthStencil, q.AutoDepthStencilFormat, q.Flags,
+                   q.FullScreen_RefreshRateInHz, q.PresentationInterval);
+        }
+    }
     for (int k = 0; k < npp; k++) pp_out(&pps[k], pp_guest[k]);
     if (g_trace < 0) g_trace = getenv("RT_D3D9_TRACE") != NULL;
     if (g_trace) rt_log("[d3d9] %s(%s) -> 0x%x", m->name, m->sig, r);
@@ -447,6 +483,8 @@ const ComClass *class_for(char k) {
 
 // ---------------- backend loading and the host WSI ----------------
 extern "C" {
+int rt_cocoa_refresh_hz(void);
+int rt_cocoa_set_fullscreen(uint32_t hwnd, int on);
 void *rt_window_layer(uint32_t hwnd);
 void rt_window_size(uint32_t hwnd, int *w, int *h);
 void rt_cocoa_screen_size(int *w, int *h);
@@ -454,7 +492,8 @@ void rt_cocoa_screen_size(int *w, int *h);
 void wsi_size(void *hwnd, uint32_t *w, uint32_t *h) { int a = 0, b = 0; rt_window_size((uint32_t)(uintptr_t)hwnd, &a, &b); *w = (uint32_t)a; *h = (uint32_t)b; }
 void *wsi_layer(void *hwnd) { return rt_window_layer((uint32_t)(uintptr_t)hwnd); }
 int wsi_is_window(void *hwnd) { return rt_window_layer((uint32_t)(uintptr_t)hwnd) != nullptr; }
-void wsi_display(uint32_t *w, uint32_t *h, uint32_t *mhz) { int a, b; rt_cocoa_screen_size(&a, &b); *w = (uint32_t)a; *h = (uint32_t)b; *mhz = 60000; }
+int wsi_fullscreen(void *hwnd, int on) { return rt_cocoa_set_fullscreen((uint32_t)(uintptr_t)hwnd, on); }
+void wsi_display(uint32_t *w, uint32_t *h, uint32_t *mhz) { int a, b; rt_cocoa_screen_size(&a, &b); *w = (uint32_t)a; *h = (uint32_t)b; *mhz = (uint32_t)rt_cocoa_refresh_hz() * 1000; }
 
 typedef IDirect3D9 *(WINAPI *PFN_Create9)(UINT);
 
@@ -491,6 +530,7 @@ PFN_Create9 load_backend() {
     setenv("DXVK_LOG_PATH", logs.c_str(), 0);
     setenv("DXVK_SHADER_CACHE_PATH", logs.c_str(), 0);
     setenv("DXVK_STATE_CACHE_PATH", logs.c_str(), 0);
+    setenv("DXVK_FRAME_RATE", "0", 0);   // no built-in limiter: CAMetalLayer's vsync paces the frames
     const char *path = getenv("RT_D3D9_LIBRARY");
     std::vector<std::string> tries;
     if (path) tries.push_back(path);
@@ -503,7 +543,7 @@ PFN_Create9 load_backend() {
     auto setcb = reinterpret_cast<void (*)(const DxvkHostWsiCallbacks *)>(dlsym(lib, "dxvk_host_wsi_set_callbacks"));
     if (setcb) {
         static DxvkHostWsiCallbacks cb = {};
-        cb.version = 1; cb.get_window_size = wsi_size; cb.get_metal_layer = wsi_layer; cb.is_window = wsi_is_window; cb.get_display = wsi_display;
+        cb.version = 1; cb.get_window_size = wsi_size; cb.get_metal_layer = wsi_layer; cb.is_window = wsi_is_window; cb.get_display = wsi_display; cb.set_fullscreen = wsi_fullscreen;
         setcb(&cb);
         setenv("DXVK_WSI_DRIVER", "Host", 0);
     }

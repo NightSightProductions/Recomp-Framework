@@ -1,3 +1,4 @@
+#include "com32.h"
 // Universal CRT / VC runtime for 32-bit guests (api-ms-win-crt-*, vcruntime140, msvcp140): startup tables,
 // heap, strings, stdio on host files, printf/scanf over guest va_lists, and the x87 / SSE2 math entry points.
 #include "rt32.h"
@@ -71,8 +72,8 @@ CSHIM(crt__purecall) { rt_fatal("pure virtual function call"); }
 CSHIM(crt__Xlength_error_std__YAXPBD_Z) { rt_fatal("std::length_error: %s", STR(0) ? STR(0) : "?"); }
 CSHIM(crt__cexit) { rt_log("[crt] _cexit from 0x%x", rd32(c->esp)); run_atexit(); return 0; }
 CSHIM(crt__c_exit) { return 0; }
-CSHIM(crt_exit) { rt_log("[crt] exit(%d) from 0x%x", (int)ARG(0), rd32(c->esp)); run_atexit(); fflush(NULL); _exit((int)ARG(0)); }
-CSHIM(crt__exit) { rt_log("[crt] _exit(%d) from 0x%x", (int)ARG(0), rd32(c->esp)); fflush(NULL); _exit((int)ARG(0)); }
+CSHIM(crt_exit) { rt_log("[crt] exit(%d) from 0x%x", (int)ARG(0), rd32(c->esp)); run_atexit(); com_callsites_dump(); fflush(NULL); _exit((int)ARG(0)); }
+CSHIM(crt__exit) { rt_log("[crt] _exit(%d) from 0x%x", (int)ARG(0), rd32(c->esp)); com_callsites_dump(); fflush(NULL); _exit((int)ARG(0)); }
 CSHIM(crt__errno) {
     uint32_t teb = c->fsbase;
     return teb + 0xF00;   // a per-thread int inside the TEB page
@@ -139,14 +140,39 @@ CSHIM(crt_mbstowcs) {
 }
 static _Thread_local uint32_t rand_state = 1;
 CSHIM(crt_rand) { rand_state = rand_state * 214013u + 2531011u; return (rand_state >> 16) & 0x7FFF; }
-typedef struct { CPU *c; uint32_t cmp; } QCtx;
-static int q_thunk(void *ctx, const void *a, const void *b) {
-    QCtx *q = ctx; uint32_t args[2] = {H2G(a), H2G(b)};
-    return (int32_t)guest_call(q->c, q->cmp, 2, args);
+// qsort: the comparator must only ever see pointers into the guest's array (host qsort may sort through a
+// temporary host buffer), so sort in place in guest memory: quicksort with insertion sort for short ranges.
+static int q_cmp(CPU *c, uint32_t cmp, uint32_t a, uint32_t b) { uint32_t args[2] = {a, b}; return (int32_t)guest_call(c, cmp, 2, args); }
+static void q_swap(uint32_t a, uint32_t b, uint32_t w) {
+    if (a == b) return;
+    uint8_t *x = G2H(a), *y = G2H(b), t;
+    for (uint32_t i = 0; i < w; i++) { t = x[i]; x[i] = y[i]; y[i] = t; }
+}
+static void q_sort(CPU *c, uint32_t base, uint32_t n, uint32_t w, uint32_t cmp) {
+    while (n > 8) {
+        uint32_t mid = base + (n / 2) * w, last = base + (n - 1) * w;
+        // median of three to the front, then Hoare-style partition around it
+        if (q_cmp(c, cmp, mid, base) < 0) q_swap(mid, base, w);
+        if (q_cmp(c, cmp, last, base) < 0) q_swap(last, base, w);
+        if (q_cmp(c, cmp, last, mid) < 0) q_swap(last, mid, w);
+        q_swap(base, mid, w);   // pivot at base
+        uint32_t i = 1, j = n - 1;
+        for (;;) {
+            while (i <= j && q_cmp(c, cmp, base + i * w, base) < 0) i++;
+            while (j >= i && q_cmp(c, cmp, base + j * w, base) > 0) j--;
+            if (i >= j) break;
+            q_swap(base + i * w, base + j * w, w); i++; j--;
+        }
+        q_swap(base, base + j * w, w);
+        // recurse into the smaller half, loop on the larger
+        if (j < n - j - 1) { q_sort(c, base, j, w, cmp); base += (j + 1) * w; n -= j + 1; }
+        else { q_sort(c, base + (j + 1) * w, n - j - 1, w, cmp); n = j; }
+    }
+    for (uint32_t i = 1; i < n; i++)
+        for (uint32_t k = i; k > 0 && q_cmp(c, cmp, base + (k - 1) * w, base + k * w) > 0; k--) q_swap(base + (k - 1) * w, base + k * w, w);
 }
 CSHIM(crt_qsort) {
-    QCtx q = {c, ARG(3)};
-    if (ARG(1) > 1) qsort_r(G2H(ARG(0)), ARG(1), ARG(2), &q, q_thunk);
+    if (ARG(1) > 1 && ARG(2)) q_sort(c, ARG(0), ARG(1), ARG(2), ARG(3));
     return 0;
 }
 

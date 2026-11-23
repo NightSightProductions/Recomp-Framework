@@ -16,6 +16,13 @@
 #define ARGF(i) rdsf(c->esp + 4 + 4 * (i))
 #define ARGD(i) rdsd(c->esp + 4 + 4 * (i))          // a double occupying stack slots i, i+1
 #define ARG64(i) rds64(c->esp + 4 + 4 * (i))
+// Natives (translator --native: guest functions replaced by host code; RT_NATIVE_OFF=all|addr,... runs the translated
+// code instead). A native reads its arguments with ARG(i) (this = c->ecx for thiscall), sets c->eax, and pops its
+// stack arguments itself if the guest function is callee-cleanup (stdcall/thiscall `ret n`): NATIVE_POP(n slots).
+// CALL_ORIG runs the translated original with the same registers and arguments, leaving esp as it was.
+int rt_native_enabled(uint32_t a);
+#define NATIVE_POP(n) (c->esp += 4u * (n))
+#define CALL_ORIG(addr) do { void F_##addr##__orig(CPU *); uint32_t sp_ = c->esp; F_##addr##__orig(c); c->esp = sp_; } while (0)
 static inline void *gp(uint32_t a) { return a ? G2H(a) : NULL; }      // guest pointer -> host (NULL stays NULL)
 static inline uint32_t hg(const void *p) { return p ? H2G(p) : 0; }   // host pointer into the window -> guest
 #define PTR(i)  gp(ARG(i))
@@ -84,6 +91,9 @@ extern RtGame32 rt_game;
 // paths: Windows path in the game -> host path (backslashes, drive letters, the save folder)
 const char *rt_host_path(const char *win, char *out, size_t n);
 extern char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
+// set before rt_init: called once with the whole guest window while it is still mapped read/write and before anything
+// is protected (a GPU API can wrap it then, e.g. Metal's newBufferWithBytesNoCopy, which refuses PROT_NONE pages)
+extern void (*rt_guest_window_hook)(void *base, uint64_t size);
 
 // UTF-16 helpers
 size_t w_len(const uint16_t *s);

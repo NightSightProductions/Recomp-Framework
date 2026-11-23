@@ -115,12 +115,25 @@ static void render_source(Voice *v, float *out, int n) {
     }
 }
 
+// XAudio2's default matrices: identity for equal layouts, mono to the front pair, and standard downmixes
+// (channel order FL FR C LFE BL BR SL SR; the LFE is dropped when downmixing)
 static void default_matrix(uint32_t sc, uint32_t dc, float *m) {
     memset(m, 0, sizeof(float) * MAXCH * MAXCH);
-    for (uint32_t d = 0; d < dc; d++) for (uint32_t s = 0; s < sc; s++) {
-        if (sc == 1) m[d * sc + s] = dc == 1 ? 1.0f : (d < 2 ? 1.0f : 0.0f);   // mono -> front left/right
-        else if (s == d || (dc == 1)) m[d * sc + s] = dc == 1 ? 1.0f / sc : 1.0f;
+#define G(o, i, g) m[(o) * sc + (i)] = (g)
+    if (sc == dc) { for (uint32_t i = 0; i < sc; i++) G(i, i, 1.0f); return; }
+    if (sc == 1) { G(0, 0, 1.0f); if (dc > 1) G(1, 0, 1.0f); return; }
+    if (dc == 1) { for (uint32_t i = 0; i < sc; i++) if (i != 3 || sc < 4) G(0, i, 1.0f / sc); return; }
+    if (dc == 2) {
+        G(0, 0, 1.0f); G(1, 1, 1.0f);
+        if (sc >= 3) { G(0, 2, 0.7071f); G(1, 2, 0.7071f); }                 // center
+        if (sc >= 6) { G(0, 4, 0.7071f); G(1, 5, 0.7071f); }                 // back / side pair
+        if (sc >= 8) { G(0, 6, 0.7071f); G(1, 7, 0.7071f); }
+        if (sc == 4) { G(0, 2, 0.7071f); G(1, 3, 0.7071f); G(0, 2, 0); }      // quad: back pair to front
+        if (sc == 4) { m[0 * sc + 2] = 0.7071f; m[1 * sc + 3] = 0.7071f; m[1 * sc + 2] = 0; }
+        return;
     }
+    for (uint32_t i = 0; i < sc && i < dc; i++) G(i, i, 1.0f);
+#undef G
 }
 static void route(Voice *v, const float *in, int n) {
     int nout = v->nsend ? v->nsend : 1;
@@ -228,7 +241,7 @@ static void *audio_main(void *arg) {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), passes = 0;
     for (;;) {
         // pace: keep ~3 passes queued for the device (or real time when there is no device)
-        if (have_out) { while (ring_w - ring_r > 3 * PASS) usleep(2000); }
+        if (have_out) { while (ring_w - ring_r > 6 * PASS) usleep(2000); }
         else { uint64_t due = t0 + passes * 10000000ull, now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (due > now) usleep((useconds_t)((due - now) / 1000)); }
         passes++;
         if (!engine_running) { if (have_out) { for (int i = 0; i < PASS; i++, ring_w++) ring[(ring_w % RING) * 2] = ring[(ring_w % RING) * 2 + 1] = 0; } continue; }
@@ -375,6 +388,12 @@ static uint32_t s_SubmitSourceBuffer(CPU *c, ComObj *s, const ComMethod *m) {
     q->loop_begin = rd32(b + 20); q->loop_len = rd32(b + 24); q->loop_count = rd32(b + 28); q->ctx = rd32(b + 32);
     q->frames = v->block_align ? q->bytes / v->block_align : 0;
     q->pcm = NULL;
+    {   // RT_AUDIO_DUMP=file: append every PCM buffer submitted to multichannel voices (debugging)
+        static FILE *dump; static int tried;
+        if (!tried) { tried = 1; const char *d = getenv("RT_AUDIO_DUMP"); if (d) dump = fopen(d, "wb"); }
+        if (dump && v->tag == 1 && v->channels >= 6) fwrite(G2H(q->data), 1, q->bytes, dump);
+    }
+    { static int n; if (getenv("RT_AUDIO_TRACE") && n++ < 12) rt_log("[xaudio2] submit #%d: flags 0x%x bytes %u data 0x%x play %u+%u loop %u+%u x%u ctx 0x%x (queued %d)", n, q->flags, q->bytes, q->data, q->play_begin, q->play_len, q->loop_begin, q->loop_len, q->loop_count, q->ctx, v->nq); }
     if (v->tag == 2 && v->adpcm_spb) q->pcm = adpcm_decode(v, G2H(q->data), q->bytes, &q->frames);
     if (!pcm_ok(v)) q->frames = (uint64_t)q->bytes * 8 / (v->bits ? v->bits : 4) / (v->channels ? v->channels : 1);   // approximate duration
     pthread_mutex_unlock(&xmu);

@@ -4,3 +4,9 @@
 [submodule "third_party/ffmpeg"]
 	path = third_party/ffmpeg
 	url = https://github.com/FFmpeg/FFmpeg.git
+[submodule "third_party/dxbc-spirv"]
+	path = third_party/dxbc-spirv
+	url = https://github.com/doitsujin/dxbc-spirv.git
+[submodule "third_party/spirv-cross"]
+	path = third_party/spirv-cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git

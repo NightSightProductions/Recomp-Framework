@@ -71,6 +71,8 @@ int rt_mouse_dx, rt_mouse_dy, rt_mouse_dz;
     l.pixelFormat = MTLPixelFormatBGRA8Unorm;
     l.framebufferOnly = NO;
     l.maximumDrawableCount = 3;
+    l.contentsGravity = kCAGravityResizeAspect;   // fullscreen / resized: scale the game's frame, keep its aspect
+    l.needsDisplayOnBoundsChange = NO;
     return l;
 }
 - (void)key:(NSEvent *)e down:(int)down {
@@ -98,6 +100,8 @@ int rt_mouse_dx, rt_mouse_dy, rt_mouse_dz;
     // client coordinates in the game's back-buffer pixels
     rt_mouse_x = (int)(p.x / s.width * l.drawableSize.width);
     rt_mouse_y = (int)((s.height - p.y) / s.height * l.drawableSize.height);
+    // Windows sends WM_SETCURSOR (HTCLIENT, the mouse message) first: games hide the cursor there with SetCursor(NULL)
+    rt_post_message(self.hwnd, 0x0020, self.hwnd, 1u | (msg << 16));
     rt_post_message(self.hwnd, msg, 0, (uint32_t)(rt_mouse_x & 0xFFFF) | ((uint32_t)rt_mouse_y << 16));
 }
 - (void)mouseMoved:(NSEvent *)e { __atomic_add_fetch(&rt_mouse_dx, (int)e.deltaX, __ATOMIC_RELAXED); __atomic_add_fetch(&rt_mouse_dy, (int)e.deltaY, __ATOMIC_RELAXED); [self mouse:e msg:0x0200]; }
@@ -109,13 +113,25 @@ int rt_mouse_dx, rt_mouse_dy, rt_mouse_dz;
 - (void)rightMouseUp:(NSEvent *)e { rt_keys[2] = 0; [self mouse:e msg:0x0205]; }
 @end
 
+static int cursor_count, cursor_hidden, cursor_null, cursor_fs;   // ShowCursor counter, NSCursor hidden, SetCursor(NULL), D3D fullscreen
+static void cursor_apply(void) {   // main thread: hidden while the game hides it (ShowCursor < 0 or SetCursor(NULL))
+    int hide = (cursor_count < 0 || cursor_null || cursor_fs) && NSApp.isActive;
+    if (hide && !cursor_hidden) { [NSCursor hide]; cursor_hidden = 1; }
+    else if (!hide && cursor_hidden) { [NSCursor unhide]; cursor_hidden = 0; }
+}
 @interface RtWindowDelegate : NSObject <NSWindowDelegate>
 @property uint32_t hwnd;
 @end
 @implementation RtWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow *)w { rt_post_message(self.hwnd, 0x0010, 0, 0); return NO; }   // WM_CLOSE
-- (void)windowDidBecomeKey:(NSNotification *)n { rt_post_message(self.hwnd, 0x0006, 1, 0); }        // WM_ACTIVATE
-- (void)windowDidResignKey:(NSNotification *)n { memset(rt_keys, 0, sizeof rt_keys); rt_post_message(self.hwnd, 0x0006, 0, 0); }
+- (void)windowDidBecomeKey:(NSNotification *)n {
+    cursor_apply();
+    rt_post_message(self.hwnd, 0x0006, 1, 0);   // WM_ACTIVATE
+}
+- (void)windowDidResignKey:(NSNotification *)n {
+    if (cursor_hidden) { [NSCursor unhide]; cursor_hidden = 0; }   // the cursor comes back over other apps
+    memset(rt_keys, 0, sizeof rt_keys); rt_post_message(self.hwnd, 0x0006, 0, 0);
+}
 @end
 
 static NSMutableDictionary<NSNumber *, NSWindow *> *windows;
@@ -132,6 +148,7 @@ void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h) {
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = t;
         win.releasedWhenClosed = NO;
+        win.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
         RtView *v = [[RtView alloc] initWithFrame:r];
         v.hwnd = hwnd; v.wantsLayer = YES;
         win.contentView = v;
@@ -159,9 +176,51 @@ void rt_cocoa_set_size(uint32_t hwnd, int w, int h) {
     });
 }
 
+// fullscreen on/off (macOS fullscreen space; the layer scales the game's back buffer to the screen)
+int rt_cocoa_set_fullscreen(uint32_t hwnd, int on) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSWindow *win = windows[@(hwnd)];
+        if (!win) return;
+        int is = (win.styleMask & NSWindowStyleMaskFullScreen) != 0;
+        if (is != (on != 0)) [win toggleFullScreen:nil];
+    });
+    return 1;
+}
+int rt_cocoa_is_fullscreen(uint32_t hwnd) {
+    __block int r = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{ NSWindow *w = windows[@(hwnd)]; r = w && (w.styleMask & NSWindowStyleMaskFullScreen); });
+    return r;
+}
+
 void rt_cocoa_set_title(uint32_t hwnd, const char *title) {
     NSString *t = [NSString stringWithUTF8String:title] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{ windows[@(hwnd)].title = t; });
+}
+
+// the display's refresh rate (Hz): ProMotion Macs run at 120
+int rt_cocoa_refresh_hz(void) {
+    __block NSInteger hz = 60;
+    void (^q)(void) = ^{ hz = NSScreen.mainScreen.maximumFramesPerSecond; };
+    if ([NSThread isMainThread]) q(); else dispatch_sync(dispatch_get_main_queue(), q);
+    return hz > 0 ? (int)hz : 60;
+}
+// ShowCursor's display counter: the cursor is hidden while it is below zero (Windows semantics)
+int rt_cocoa_show_cursor(int show) {
+    int n = __atomic_add_fetch(&cursor_count, show ? 1 : -1, __ATOMIC_SEQ_CST);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        cursor_apply();
+    });
+    return n;
+}
+// exclusive fullscreen (D3D9 Windowed = FALSE): Windows draws no system cursor over the game there
+void rt_cocoa_set_cursor_fullscreen(int on) {
+    __atomic_store_n(&cursor_fs, on, __ATOMIC_SEQ_CST);
+    dispatch_async(dispatch_get_main_queue(), ^{ cursor_apply(); });
+}
+// SetCursor: NULL hides the cursor over the game (the usual way games hide it); any cursor shows it
+void rt_cocoa_set_cursor_null(int null) {
+    if (__atomic_exchange_n(&cursor_null, null, __ATOMIC_SEQ_CST) == null) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ cursor_apply(); });
 }
 
 void rt_cocoa_screen_size(int *w, int *h) {
@@ -181,13 +240,50 @@ void rt_cocoa_run(void (*fn)(void)) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         NSMenu *bar = [NSMenu new], *app = [NSMenu new];
         NSMenuItem *item = [NSMenuItem new]; item.submenu = app; [bar addItem:item];
+        NSMenuItem *fs = [app addItemWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+        fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
         [app addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
         NSApp.mainMenu = bar;
         [NSApp finishLaunching];
+        { extern void gamepad_start(void); gamepad_start(); }   // controllers are known before the game first asks
         game_main = fn;
         pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
         pthread_attr_setstacksize(&a, 256u << 20);   // translated frames are large; the guest recurses deeply at load
         pthread_create(&t, &a, game_thread, NULL);
         [NSApp run];
     }
+}
+
+// display modes for a game's resolution list: every connected display's modes, in points and in pixels (Retina),
+// as unique width x height pairs, smallest first; returns the count (at most max)
+int rt_cocoa_display_modes(int *w, int *h, int max) {
+    __block int n = 0;
+    void (^add)(int, int) = ^(int x, int y) {
+        if (x < 640 || y < 480 || n >= max) return;
+        for (int i = 0; i < n; i++) if (w[i] == x && h[i] == y) return;
+        w[n] = x; h[n] = y; n++;
+    };
+    uint32_t ids[16], nd = 0;
+    CGGetActiveDisplayList(16, ids, &nd);
+    NSDictionary *opt = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES};
+    int maxw = 0, maxh = 0;
+    for (uint32_t d = 0; d < nd; d++) {
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(ids[d], (__bridge CFDictionaryRef)opt);
+        for (CFIndex i = 0; modes && i < CFArrayGetCount(modes); i++) {
+            CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            int pw = (int)CGDisplayModeGetPixelWidth(m), ph = (int)CGDisplayModeGetPixelHeight(m);
+            add((int)CGDisplayModeGetWidth(m), (int)CGDisplayModeGetHeight(m));
+            add(pw, ph);
+            if (pw * ph > maxw * maxh) { maxw = pw; maxh = ph; }
+        }
+        if (modes) CFRelease(modes);
+    }
+    static const int std16x9[][2] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160}};
+    for (unsigned i = 0; i < sizeof std16x9 / sizeof *std16x9; i++)
+        if (std16x9[i][0] <= maxw && std16x9[i][1] <= maxh) add(std16x9[i][0], std16x9[i][1]);
+    for (int i = 1; i < n; i++)   // by area, then width
+        for (int j = i; j > 0 && ((long)w[j] * h[j] < (long)w[j - 1] * h[j - 1] || ((long)w[j] * h[j] == (long)w[j - 1] * h[j - 1] && w[j] < w[j - 1])); j--) {
+            int t = w[j]; w[j] = w[j - 1]; w[j - 1] = t; t = h[j]; h[j] = h[j - 1]; h[j - 1] = t;
+        }
+    return n;
 }

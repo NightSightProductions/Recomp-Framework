@@ -1,3 +1,4 @@
+#include "com32.h"
 // kernel32 for 32-bit guests: handles, synchronization, threads, files (with overlapped and ReadFileEx/APC I/O),
 // memory, time, INI files.
 #include "rt32.h"
@@ -36,11 +37,13 @@ typedef struct {
     DIR *dir; char pattern[256], dirpath[1024];
     int overlapped;
     char name[128];
+    pthread_cond_t cv; int cv_init, waiters;   // single-object waiters sleep here
 } Handle;
 #define NHANDLES 8192
 static Handle handles[NHANDLES];
 static pthread_mutex_t h_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t h_cv = PTHREAD_COND_INITIALIZER;   // broadcast whenever any waitable object changes
+static pthread_cond_t h_cv = PTHREAD_COND_INITIALIZER;
+static int multi_waiters;   // threads in WaitForMultipleObjects (they sleep on h_cv)   // broadcast whenever any waitable object changes
 #define HVAL(i) (0x100u + 4u * (uint32_t)(i))
 static Handle *hget(uint32_t h) {
     if (h < 0x100 || (h & 3)) return NULL;
@@ -101,11 +104,20 @@ static uint32_t wait_many(int n, const uint32_t *hs, int all, uint32_t ms, int a
         }
         if (alertable && apc_pending()) { pthread_mutex_unlock(&h_mu); rt_run_apcs(); return 0xC0; }   // WAIT_IO_COMPLETION
         if (ms == 0) { pthread_mutex_unlock(&h_mu); return WAIT_TIMEOUT; }
-        if (ms == 0xFFFFFFFFu) pthread_cond_wait(&h_cv, &h_mu);
-        else if (pthread_cond_timedwait(&h_cv, &h_mu, &ts) == ETIMEDOUT) { pthread_mutex_unlock(&h_mu); return WAIT_TIMEOUT; }
+        pthread_cond_t *cv = &h_cv;
+        if (n == 1) { if (!o[0]->cv_init) { pthread_cond_init(&o[0]->cv, NULL); o[0]->cv_init = 1; } cv = &o[0]->cv; o[0]->waiters++; }
+        else multi_waiters++;
+        int r = ms == 0xFFFFFFFFu ? pthread_cond_wait(cv, &h_mu) : pthread_cond_timedwait(cv, &h_mu, &ts);
+        if (n == 1) o[0]->waiters--; else multi_waiters--;
+        if (r == ETIMEDOUT) { pthread_mutex_unlock(&h_mu); return WAIT_TIMEOUT; }
     }
 }
-static void kick(void) { pthread_cond_broadcast(&h_cv); }
+// an object changed state: wake its own waiters, and the multi-object waiters if there are any (h_mu held)
+static void kick_obj(Handle *o) {
+    if (o && o->cv_init && o->waiters) pthread_cond_broadcast(&o->cv);
+    if (multi_waiters || !o) pthread_cond_broadcast(&h_cv);
+}
+static void kick(void) { kick_obj(NULL); }
 
 SHIM(kernel32_WaitForSingleObject, 2) { uint32_t h = ARG(0); return wait_many(1, &h, 0, ARG(1), 0); }
 SHIM(kernel32_WaitForMultipleObjects, 4) {
@@ -124,7 +136,7 @@ SHIM(kernel32_CreateEventA, 4) {
     LAST_ERROR = 0;
     return h;
 }
-SHIM(kernel32_SetEvent, 1) { pthread_mutex_lock(&h_mu); Handle *o = hget(ARG(0)); if (o) o->signaled = 1; kick(); pthread_mutex_unlock(&h_mu); return o != NULL; }
+SHIM(kernel32_SetEvent, 1) { pthread_mutex_lock(&h_mu); Handle *o = hget(ARG(0)); if (o) { o->signaled = 1; kick_obj(o); } pthread_mutex_unlock(&h_mu); return o != NULL; }
 SHIM(kernel32_ResetEvent, 1) { pthread_mutex_lock(&h_mu); Handle *o = hget(ARG(0)); if (o) o->signaled = 0; pthread_mutex_unlock(&h_mu); return o != NULL; }
 SHIM(kernel32_CreateSemaphoreA, 4) {
     uint32_t h = hnew(H_SEM); Handle *o = hget(h);
@@ -136,7 +148,7 @@ SHIM(kernel32_ReleaseSemaphore, 3) {
     Handle *o = hget(ARG(0)); int ok = 0;
     if (o && o->type == H_SEM) {
         if (ARG(2)) wr32(ARG(2), (uint32_t)o->count);
-        if (o->count + (int)ARG(1) <= o->max) { o->count += (int)ARG(1); ok = 1; kick(); }
+        if (o->count + (int)ARG(1) <= o->max) { o->count += (int)ARG(1); ok = 1; kick_obj(o); }
     }
     pthread_mutex_unlock(&h_mu);
     return ok;
@@ -154,7 +166,7 @@ SHIM(kernel32_CreateMutexA, 3) {
 SHIM(kernel32_ReleaseMutex, 1) {
     pthread_mutex_lock(&h_mu);
     Handle *o = hget(ARG(0)); int ok = 0;
-    if (o && o->type == H_MUTEX && o->owner == rt_thread()->tid) { if (!--o->recursion) o->owner = 0; ok = 1; kick(); }
+    if (o && o->type == H_MUTEX && o->owner == rt_thread()->tid) { if (!--o->recursion) o->owner = 0; ok = 1; kick_obj(o); }
     pthread_mutex_unlock(&h_mu);
     return ok;
 }
@@ -242,7 +254,7 @@ static void *thread_main(void *p) {
     pthread_mutex_lock(&h_mu);
     Handle *o = hget(s->h);
     if (o) { o->done = 1; o->exit_code = r; }
-    kick();
+    kick_obj(o);
     pthread_mutex_unlock(&h_mu);
     return NULL;
 }
@@ -349,7 +361,7 @@ static int64_t ov_offset(uint32_t ov) { return (int64_t)(((uint64_t)rd32(ov + 12
 static void ov_done(uint32_t ov, uint32_t status, uint32_t bytes) {
     wr32(ov + 0, status); wr32(ov + 4, bytes);
     uint32_t ev = rd32(ov + 16);
-    if (ev) { pthread_mutex_lock(&h_mu); Handle *e = hget(ev); if (e) e->signaled = 1; kick(); pthread_mutex_unlock(&h_mu); }
+    if (ev) { pthread_mutex_lock(&h_mu); Handle *e = hget(ev); if (e) { e->signaled = 1; kick_obj(e); } pthread_mutex_unlock(&h_mu); }
 }
 SHIM(kernel32_ReadFile, 5) {
     Handle *f = hget(ARG(0));
@@ -668,7 +680,7 @@ RAWSHIM(kernel32_VerSetConditionMask) {   // (ULONGLONG mask, DWORD type, BYTE c
     for (int k = 0; k < 8; k++) if (type & (1u << k)) m |= (uint64_t)(cond & 7) << (3 * k);
     c->eax = (uint32_t)m; c->edx = (uint32_t)(m >> 32); c->esp += 16;
 }
-SHIM(kernel32_ExitProcess, 1) { rt_log("[k32] ExitProcess(%u)", ARG(0)); fflush(NULL); _exit((int)ARG(0)); }
+SHIM(kernel32_ExitProcess, 1) { rt_log("[k32] ExitProcess(%u)", ARG(0)); com_callsites_dump(); fflush(NULL); _exit((int)ARG(0)); }
 SHIM(kernel32_CreateProcessA, 10) { LAST_ERROR = 2; return 0; }
 SHIM(kernel32_MultiByteToWideChar, 6) {
     uint32_t src = ARG(2), dst = ARG(4); int32_t sl = (int32_t)ARG(3), dl = (int32_t)ARG(5);

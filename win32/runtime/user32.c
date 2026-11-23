@@ -70,7 +70,11 @@ static uint32_t create_window(CPU *c, int wide) {
     snprintf(w->title, sizeof w->title, "%s", t);
     uint32_t h = HWND_OF(i);
     rt_log("[user32] CreateWindow \"%s\" class %s %dx%d -> 0x%x", t, cname, w->w, w->h, h);
-    if (!(style & 0x40000000u)) w->layer = rt_cocoa_create_window(h, t, w->w, w->h);   // top-level (not WS_CHILD)
+    if (!(style & 0x40000000u)) {   // top-level (not WS_CHILD)
+        extern uint64_t rt_last_surface_hwnd;
+        w->layer = rt_cocoa_create_window(h, t, w->w, w->h);
+        rt_last_surface_hwnd = h;
+    }
     // WM_NCCREATE / WM_CREATE with a CREATESTRUCT
     uint32_t cs = gcalloc(1, 48);
     wr32(cs + 0, ARG(11)); wr32(cs + 4, ARG(9)); wr32(cs + 8, ARG(10)); wr32(cs + 12, ARG(8));
@@ -160,8 +164,16 @@ SHIM(user32_LoadIconA, 2) { return 0x20001; }
 SHIM(user32_LoadIconW, 2) { return 0x20001; }
 SHIM(user32_LoadCursorA, 2) { return 0x20002; }
 SHIM(user32_LoadAcceleratorsA, 2) { return 0x20003; }
-SHIM(user32_SetCursor, 1) { return 0; }
-SHIM(user32_ShowCursor, 1) { return ARG(0) ? 0 : (uint32_t)-1; }
+SHIM(user32_SetCursor, 1) {   // returns the previous cursor; NULL hides it
+    void rt_cocoa_set_cursor_null(int null);
+    static uint32_t cur = 0x10001;
+    uint32_t prev = cur; cur = ARG(0);
+    static int logged; if (logged < 2 && (cur == 0) != (prev == 0)) { logged++; rt_log("[user32] SetCursor(%s)", cur ? "cursor" : "NULL: hidden"); }
+    rt_cocoa_set_cursor_null(cur == 0);
+    return prev;
+}
+int rt_cocoa_show_cursor(int show);
+SHIM(user32_ShowCursor, 1) { return (uint32_t)rt_cocoa_show_cursor(ARG(0) != 0); }
 SHIM(user32_ClipCursor, 1) { return 1; }
 SHIM(user32_GetCursorPos, 1) { wr32(ARG(0), (uint32_t)rt_mouse_x); wr32(ARG(0) + 4, (uint32_t)rt_mouse_y); return 1; }
 SHIM(user32_ScreenToClient, 2) { return 1; }

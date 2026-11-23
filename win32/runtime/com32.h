@@ -42,4 +42,6 @@ uint32_t com_AddRef(CPU *c, ComObj *self, const ComMethod *m);
 uint32_t com_Release(CPU *c, ComObj *self, const ComMethod *m);
 // detach and free the guest side of an object whose host lifetime ended (bridged objects)
 void com_unwrap_free(ComObj *o);
+// RT_COM_CALLSITES: write the call-site histogram now (also done at exit)
+void com_callsites_dump(void);
 #define COM_IUNKNOWN {"QueryInterface", 3, com_QueryInterface, 0}, {"AddRef", 1, com_AddRef, 0}, {"Release", 1, com_Release, 0}

@@ -12,6 +12,7 @@
 #include "steam32_slots.h"
 #include <dlfcn.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 typedef struct { const SteamIface *ifc; int slot; } SlotCtx;
 typedef struct { const SteamIface *ifc; uint32_t guest; } Obj;
@@ -90,6 +91,7 @@ static void connect_client(void) {
 // ---------------- method implementations (by interface and method name) ----------------
 typedef struct { CPU *c; uint32_t self; uint32_t sret; } Call;
 #define A(i) rds32(c->esp + 4 + 4 * (i) + (call->sret ? 4 : 0))   // i-th declared argument (after a hidden return pointer)
+#define STR_A(i) ((const char *)gp(A(i)))
 typedef uint64_t (*Impl)(CPU *c, Call *call);
 
 static uint64_t ret1(CPU *c, Call *call) { return 1; }
@@ -100,6 +102,21 @@ static uint64_t u_GetSteamID(CPU *c, Call *call) {
     return call->sret;
 }
 static uint64_t u_GetHSteamUser(CPU *c, Call *call) { return 1; }
+// GetUserDataFolder(char *buf, int cbBuffer): where Steam games keep their saves (Steam\userdata\<id>\<app>\local on
+// Windows). A folder under the game's documents path, which rt_host_path maps into the app's data folder.
+static uint64_t u_GetUserDataFolder(CPU *c, Call *call) {
+    uint32_t buf = A(0), n = A(1);
+    char win[512], host[1200];
+    snprintf(win, sizeof win, "%s\\userdata\\%u", rt_game.docs_dir, rt_game.steam_app_id);
+    rt_host_path(win, host, sizeof host);
+    char *p = host + strlen(rt_data_dir);   // create every level below the data folder
+    for (; *p; p++) if (*p == '/') { *p = 0; mkdir(host, 0755); *p = '/'; }
+    mkdir(host, 0755);
+    if (!buf || n <= strlen(win)) return 0;
+    memcpy(G2H(buf), win, strlen(win) + 1);
+    if (rt_verbose) rt_log("[steam] GetUserDataFolder -> %s (%s)", win, host);
+    return 1;
+}
 static uint32_t persona;
 static uint64_t f_GetPersonaName(CPU *c, Call *call) {
     if (!persona) persona = gstrdup(S.online ? S.GetPersonaName(S.friends) : "Player");
@@ -120,16 +137,82 @@ static uint64_t a_BIsSubscribedApp(CPU *c, Call *call) {
 }
 static uint64_t a_BIsSubscribed(CPU *c, Call *call) { return S.online ? (uint64_t)(S.BIsSubscribed(S.apps) != 0) : 1; }
 
+// ---- ISteamRemoteStorage: the "cloud" files, kept locally in <data>/userdata/<app>/remote (Steam's own layout) ----
+#include <dirent.h>
+#include <unistd.h>
+static void rs_path(const char *name, char *out, size_t n) {
+    snprintf(out, n, "%s/userdata/%u/remote/%s", rt_data_dir, rt_game.steam_app_id, name ? name : "");
+    for (char *q = out + strlen(rt_data_dir); *q; q++) if (*q == '\\') *q = '/';
+}
+static void rs_mkdirs(char *path) {   // every directory above the file
+    for (char *q = path + strlen(rt_data_dir) + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(path, 0755); *q = '/'; }
+}
+static uint64_t rs_FileWrite(CPU *c, Call *call) {   // (const char *file, const void *data, int32 size) -> bool
+    char p[1400]; rs_path(STR_A(0), p, sizeof p); rs_mkdirs(p);
+    FILE *f = fopen(p, "wb"); if (!f) return 0;
+    size_t n = A(2) ? fwrite(G2H(A(1)), 1, A(2), f) : 0;
+    fclose(f);
+    if (rt_verbose) rt_log("[steam] RemoteStorage write %s (%u bytes)", STR_A(0), A(2));
+    return n == A(2);
+}
+static uint64_t rs_FileRead(CPU *c, Call *call) {    // (const char *file, void *data, int32 size) -> int32 bytes read
+    char p[1400]; rs_path(STR_A(0), p, sizeof p);
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    size_t n = fread(G2H(A(1)), 1, A(2), f);
+    fclose(f);
+    return n;
+}
+static uint64_t rs_FileExists(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) == 0; }
+static uint64_t rs_GetFileSize(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint32_t)st.st_size; }
+static uint64_t rs_GetFileTimestamp(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint64_t)st.st_mtime; }
+static uint64_t rs_FileDelete(CPU *c, Call *call) { char p[1400]; rs_path(STR_A(0), p, sizeof p); return unlink(p) == 0; }
+static char rs_names[256][260]; static int rs_n;
+static void rs_scan(const char *dir, const char *prefix) {
+    DIR *d = opendir(dir); struct dirent *e;
+    if (!d) return;
+    while ((e = readdir(d)) && rs_n < 256) {
+        if (e->d_name[0] == '.') continue;
+        char full[1400], rel[300]; snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+        snprintf(rel, sizeof rel, "%s%s", prefix, e->d_name);
+        if (e->d_type == DT_DIR) { char pre[300]; snprintf(pre, sizeof pre, "%s/", rel); rs_scan(full, pre); }
+        else snprintf(rs_names[rs_n++], 260, "%s", rel);
+    }
+    closedir(d);
+}
+static uint64_t rs_GetFileCount(CPU *c, Call *call) { char p[1400]; rs_path("", p, sizeof p); rs_n = 0; rs_scan(p, ""); return (uint32_t)rs_n; }
+static uint32_t rs_name_buf;
+static uint64_t rs_GetFileNameAndSize(CPU *c, Call *call) {   // (int index, int32 *size) -> const char *
+    int i = (int)A(0);
+    if (i < 0 || i >= rs_n) { if (A(1)) wr32(A(1), 0); return 0; }
+    char p[1400]; struct stat st; rs_path(rs_names[i], p, sizeof p);
+    if (A(1)) wr32(A(1), stat(p, &st) ? 0 : (uint32_t)st.st_size);
+    if (!rs_name_buf) rs_name_buf = gmalloc(264);
+    snprintf(G2H(rs_name_buf), 260, "%s", rs_names[i]);
+    return rs_name_buf;
+}
+static uint64_t rs_GetQuota(CPU *c, Call *call) {    // (uint64 *total, uint64 *available) -> bool
+    if (A(0)) wr64(A(0), 100ull << 20);
+    if (A(1)) wr64(A(1), 100ull << 20);
+    return 1;
+}
+
 typedef struct { const char *iface, *method; Impl fn; } ImplRow;
 static const ImplRow impls[] = {
     {"ISteamUser", "GetHSteamUser", u_GetHSteamUser}, {"ISteamUser", "BLoggedOn", u_BLoggedOn},
-    {"ISteamUser", "GetSteamID", u_GetSteamID},
+    {"ISteamUser", "GetSteamID", u_GetSteamID}, {"ISteamUser", "GetUserDataFolder", u_GetUserDataFolder},
     {"ISteamFriends", "GetPersonaName", f_GetPersonaName},
     {"ISteamUtils", "GetAppID", ut_GetAppID}, {"ISteamUtils", "GetIPCountry", ut_GetIPCountry},
     {"ISteamUtils", "IsOverlayEnabled", NULL}, {"ISteamUtils", "BOverlayNeedsPresent", NULL},
     {"ISteamApps", "GetCurrentGameLanguage", a_GetCurrentGameLanguage}, {"ISteamApps", "GetAvailableGameLanguages", a_GetCurrentGameLanguage},
     {"ISteamApps", "BIsDlcInstalled", a_BIsDlcInstalled}, {"ISteamApps", "BIsSubscribedApp", a_BIsSubscribedApp},
     {"ISteamApps", "BIsSubscribed", a_BIsSubscribed}, {"ISteamApps", "BIsAppInstalled", a_BIsSubscribedApp},
+    {"ISteamRemoteStorage", "FileWrite", rs_FileWrite}, {"ISteamRemoteStorage", "FileRead", rs_FileRead},
+    {"ISteamRemoteStorage", "FileExists", rs_FileExists}, {"ISteamRemoteStorage", "FilePersisted", rs_FileExists},
+    {"ISteamRemoteStorage", "GetFileSize", rs_GetFileSize}, {"ISteamRemoteStorage", "GetFileTimestamp", rs_GetFileTimestamp},
+    {"ISteamRemoteStorage", "FileDelete", rs_FileDelete}, {"ISteamRemoteStorage", "FileForget", ret1},
+    {"ISteamRemoteStorage", "GetFileCount", rs_GetFileCount}, {"ISteamRemoteStorage", "GetFileNameAndSize", rs_GetFileNameAndSize},
+    {"ISteamRemoteStorage", "GetQuota", rs_GetQuota}, {"ISteamRemoteStorage", "IsCloudEnabledForAccount", ret1},
+    {"ISteamRemoteStorage", "IsCloudEnabledForApp", ret1}, {"ISteamRemoteStorage", "SetCloudEnabledForApp", NULL},
     // stats: accept, report success (no achievements offline yet; online bridging comes with callbacks)
     {"ISteamUserStats", "RequestCurrentStats", ret1}, {"ISteamUserStats", "StoreStats", ret1},
     {"ISteamUserStats", "SetAchievement", ret1}, {"ISteamUserStats", "ClearAchievement", ret1},

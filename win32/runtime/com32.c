@@ -1,4 +1,5 @@
 #include "com32.h"
+#include <time.h>
 
 #define COM_MAGIC 0xC0C0A32Bu
 #define NOBJ (1 << 20)
@@ -8,11 +9,45 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct { const ComClass *cls; int idx; } Slot;
 
+// RT_COM_CALLSITES=1: count every COM call by (method, guest return address) and write the histogram to
+// <data dir>/com_callsites.txt at exit (tools/callsites.py maps return addresses to the calling functions)
+#define CS_N (1 << 16)
+typedef struct { const Slot *slot; uint32_t ret; uint64_t n; } CallSite;
+static CallSite *cs_tab; static pthread_mutex_t cs_mu = PTHREAD_MUTEX_INITIALIZER;
+static void cs_dump(void) {
+    char p[1200]; snprintf(p, sizeof p, "%s/com_callsites.txt", rt_data_dir);
+    FILE *f = fopen(p, "w"); if (!f) return;
+    pthread_mutex_lock(&cs_mu);
+    for (int i = 0; i < CS_N; i++) if (cs_tab[i].slot)
+        fprintf(f, "%llu %08x %s::%s\n", (unsigned long long)cs_tab[i].n, cs_tab[i].ret, cs_tab[i].slot->cls->name, cs_tab[i].slot->cls->methods[cs_tab[i].slot->idx].name);
+    pthread_mutex_unlock(&cs_mu);
+    fclose(f);
+    rt_log("[com] call sites written to %s", p);
+}
+static void cs_count(const Slot *s, uint32_t ret) {
+    pthread_mutex_lock(&cs_mu);
+    if (!cs_tab) { cs_tab = calloc(CS_N, sizeof *cs_tab); atexit(cs_dump); }
+    uint32_t h = (ret * 2654435761u ^ (uint32_t)((uintptr_t)s >> 3)) & (CS_N - 1);
+    for (int k = 0; k < CS_N; k++, h = (h + 1) & (CS_N - 1)) {
+        CallSite *e = &cs_tab[h];
+        if (!e->slot) { e->slot = s; e->ret = ret; }
+        if (e->slot == s && e->ret == ret) { e->n++; break; }
+    }
+    static uint64_t calls, last; int dump = 0;
+    if ((++calls & 0xFFFF) == 0) { uint64_t t = (uint64_t)time(NULL); if (t - last >= 10) { last = t; dump = 1; } }
+    pthread_mutex_unlock(&cs_mu);
+    if (dump) cs_dump();
+}
+void com_callsites_dump(void) { if (cs_tab) cs_dump(); }
+
 static void trampoline(CPU *c, uintptr_t ctx) {
     const Slot *s = (const Slot *)ctx;
     const ComMethod *m = &s->cls->methods[s->idx];
     ComObj *self = com_host(ARG(0));
     uint32_t r;
+    static int sites = -1;
+    if (sites < 0) sites = getenv("RT_COM_CALLSITES") != NULL;
+    if (sites) cs_count(s, rd32(c->esp));
     if (!self) { rt_log("[com] %s::%s on a foreign object 0x%x", s->cls->name, m->name, ARG(0)); r = 0x80004003u; }
     else if (m->fn) r = m->fn(c, self, m);
     else {

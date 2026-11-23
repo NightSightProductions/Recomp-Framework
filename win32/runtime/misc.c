@@ -1,3 +1,4 @@
+#include <string.h>
 // The small DLLs: winmm, advapi32, shell32, ole32/oleaut32, gdi32, imm32, iphlpapi, ws2_32, XInput, DirectInput,
 // Steam (offline), and the not-yet-implemented media and graphics entry points (they fail cleanly and log).
 #include "rt32.h"
@@ -64,10 +65,39 @@ SHIM(iphlpapi_GetAdaptersAddresses, 5) { if (ARG(4)) wr32(ARG(4), 0); return 232
 SHIM(iphlpapi_GetIfEntry, 1) { return 50; }   // ERROR_NOT_SUPPORTED
 
 // ---- XInput 1.4 (ordinals): no controller yet (GameController bridge comes with the input layer) ----
-SHIM(xinput1_4_ord2, 2) { return 1167; }   // XInputGetState -> ERROR_DEVICE_NOT_CONNECTED
-SHIM(xinput1_4_ord3, 2) { return 1167; }   // XInputSetState
-SHIM(xinput1_4_ord4, 3) { return 1167; }   // XInputGetCapabilities
+// XInput on the GameController framework (framework/runtime/gamepad.m, shared with the 64-bit runtime)
+int gamepad_state(int user, uint8_t out[16], int guide);
+int gamepad_connected(int user);
+int gamepad_rumble(int user, uint16_t left, uint16_t right);
+SHIM(xinput1_4_ord2, 2) {   // XInputGetState(user, XINPUT_STATE *)
+    uint8_t st[16];
+    if (!gamepad_state((int)ARG(0), st, 0)) return 1167;    // ERROR_DEVICE_NOT_CONNECTED
+    if (ARG(1)) memcpy(G2H(ARG(1)), st, 16);
+    return 0;
+}
+SHIM(xinput1_4_ord3, 2) {   // XInputSetState(user, XINPUT_VIBRATION * {left, right})
+    uint32_t v = ARG(1);
+    return gamepad_rumble((int)ARG(0), v ? rd16(v) : 0, v ? rd16(v + 2) : 0) ? 0 : 1167;
+}
+SHIM(xinput1_4_ord4, 3) {   // XInputGetCapabilities(user, flags, XINPUT_CAPABILITIES *): a full standard gamepad
+    if (!gamepad_connected((int)ARG(0))) return 1167;
+    uint32_t p = ARG(2);
+    if (p) {
+        memset(G2H(p), 0, 20);
+        wr8(p, 1); wr8(p + 1, 1); wr16(p + 2, 0x0001);
+        wr16(p + 4, 0xF3FF); wr8(p + 6, 0xFF); wr8(p + 7, 0xFF);
+        for (int i = 0; i < 4; i++) wr16(p + 8 + 2 * i, 0xFFC0);
+        wr16(p + 16, 0xFFFF); wr16(p + 18, 0xFFFF);
+    }
+    return 0;
+}
 SHIM(xinput1_4_ord5, 1) { return 0; }      // XInputEnable
+// gamepad.m's hooks: the game window gets WM_DEVICECHANGE on connects/disconnects
+uint64_t rt_last_surface_hwnd;
+void win_from_cocoa(uint64_t h, uint32_t msg, uint64_t wp, uint64_t lp) {
+    void rt_post_message(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+    rt_post_message((uint32_t)h, msg, (uint32_t)wp, (uint32_t)lp);
+}
 
 // ---- not yet implemented: fail the way a missing component does on Windows, and say so once ----
 #define NOTYET(sym, n, ret, what) SHIM(sym, n) { static int once; if (!once++) rt_log("[todo] %s: %s", #sym, what); return ret; }

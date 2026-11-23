@@ -27,6 +27,9 @@ void rt_fatal(const char *fmt, ...) {
 // ---------------- guest address space ----------------
 // The whole 4 GiB window is reserved PROT_NONE at GUEST_BASE. vm_* hands out 64 KiB-granular regions of it, the
 // way VirtualAlloc does; everything the guest allocates (heap, stacks, TEBs) comes from there.
+// The window is never re-mmapped after startup (only mprotect and madvise): a GPU buffer wrapping guest memory
+// (rt_guest_window_hook, e.g. a Metal renderer's newBufferWithBytesNoCopy) would keep seeing the old pages. Released
+// regions are marked dirty and zeroed when they are handed out again.
 #define VM_GRAN   0x10000u
 #define VM_LO     0x01000000u            // above the image (0x400000 + ~10 MB)
 #define VM_HI     0xFF000000u            // host-function trampolines live above
@@ -34,6 +37,7 @@ void rt_fatal(const char *fmt, ...) {
 static uint32_t vm_owner[VM_UNITS];      // unit -> first unit of its allocation + 1 (0 = free)
 static uint32_t vm_len[VM_UNITS];        // at the first unit: allocation length in units
 static uint8_t  vm_commit_prot[VM_UNITS];
+static uint8_t  vm_dirty[VM_UNITS];      // released since its last use: zero it before handing it out
 static pthread_mutex_t vm_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t vm_hint = 0;
 
@@ -76,10 +80,16 @@ uint32_t gvm_alloc(uint32_t addr, uint32_t size, int commit, uint32_t prot) {
     vm_len[first] = units;
     vm_commit_prot[first] = (uint8_t)prot;
     uint32_t ga = VM_LO + first * VM_GRAN;
-    if (commit) {
-        // fresh memory reads as zero, like VirtualAlloc's
-        mmap(G2H(ga), (size_t)units * VM_GRAN, host_prot(prot), MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
-    }
+    // fresh memory reads as zero, like VirtualAlloc's
+    for (uint32_t k = 0; k < units; k++)
+        if (vm_dirty[first + k]) {
+            uint8_t *h = G2H(ga + k * VM_GRAN);
+            mprotect(h, VM_GRAN, PROT_READ | PROT_WRITE);
+            madvise(h, VM_GRAN, MADV_FREE_REUSE);       // pages marked reusable can otherwise still be discarded later
+            memset(h, 0, VM_GRAN); mprotect(h, VM_GRAN, PROT_NONE);
+            vm_dirty[first + k] = 0;
+        }
+    if (commit) mprotect(G2H(ga), (size_t)units * VM_GRAN, host_prot(prot));
     pthread_mutex_unlock(&vm_mu);
     return ga;
 }
@@ -90,8 +100,10 @@ int gvm_free(uint32_t addr) {
     uint32_t u = (addr - VM_LO) / VM_GRAN;
     if (!vm_owner[u] || vm_owner[u] != u + 1) { pthread_mutex_unlock(&vm_mu); return 0; }
     uint32_t n = vm_len[u];
-    for (uint32_t k = 0; k < n; k++) vm_owner[u + k] = 0;
-    mmap(G2H(addr), (size_t)n * VM_GRAN, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    for (uint32_t k = 0; k < n; k++) { vm_owner[u + k] = 0; vm_dirty[u + k] = 1; }
+    mprotect(G2H(addr), (size_t)n * VM_GRAN, PROT_READ | PROT_WRITE);
+    madvise(G2H(addr), (size_t)n * VM_GRAN, MADV_FREE_REUSABLE);    // give the pages back; zeroed on reuse
+    mprotect(G2H(addr), (size_t)n * VM_GRAN, PROT_NONE);
     if (u < vm_hint) vm_hint = u;
     pthread_mutex_unlock(&vm_mu);
     return 1;
@@ -458,7 +470,7 @@ static void load_image(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) rt_fatal("can't open the game image %s: %s", path, strerror(errno));
     // header page (the CRT and Steam read the PE header through GetModuleHandle(NULL))
-    mmap(G2H(gimage_base), (gimage_size + 0xFFF) & ~0xFFFu, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    mprotect(G2H(gimage_base), (gimage_size + 0xFFF) & ~0xFFFu, PROT_READ | PROT_WRITE);   // untouched: reads as zero
     pread(fd, G2H(gimage_base), 0x1000, 0);
     for (int i = 0; i < ngsections; i++) {
         const GSection *s = &gsections[i];
@@ -479,6 +491,7 @@ static void process_init(void) {
 }
 
 char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
+void (*rt_guest_window_hook)(void *base, uint64_t size);
 int rt_game_main(int argc, char **argv);   // game.c: settings, then rt_run
 
 #include <mach-o/dyld.h>
@@ -497,8 +510,11 @@ void rt_init(const char *image_path) {
         if (!image_path) rt_fatal("the game image %s was not found next to %s (build it with the game project's Makefile)", rt_game.image, rt_exe_dir);
     }
     void *want = (void *)(uintptr_t)GUEST_BASE;
-    void *m = mmap(want, 1ull << 32, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    // mapped read/write (lazily, nothing is committed) so a GPU API can wrap it, then protected
+    void *m = mmap(want, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (m != want) rt_fatal("couldn't reserve the guest address space at %p (got %p)", want, m);
+    if (rt_guest_window_hook) rt_guest_window_hook(m, 1ull << 32);
+    mprotect(m, 1ull << 32, PROT_NONE);
     struct sigaction sa = {0};
     sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGFPE, &sa, NULL);
