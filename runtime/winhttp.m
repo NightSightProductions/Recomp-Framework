@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #include <pthread.h>
 #include "rt.h"
+#include "game.h"
 
 #define FLAG_ASYNC 0x10000000u
 #define FLAG_SECURE 0x00800000u
@@ -195,7 +196,12 @@ static void enqueue(Hnd *h, int op, uint32_t n, uint64_t buf, uint64_t out) {
 static Hnd *H(uint64_t p, int kind) { Hnd *h = PTR(p); return h && h->kind == kind ? h : NULL; }
 
 // ---------------- API ----------------
-void I_winhttp_dll_WinHttpCheckPlatform(CPU *c) { RET(getenv("RT_NO_HTTP") ? 0 : 1); }   // RT_NO_HTTP=1: as if WinHTTP were unavailable
+// As if WinHTTP were unavailable: RT_NO_HTTP=1, or rt_game.offline_no_http with the Steam layer offline
+void I_winhttp_dll_WinHttpCheckPlatform(CPU *c) {
+    int off = getenv("RT_NO_HTTP") || (rt_game.offline_no_http && rt_steam_offline());
+    if (off) rt_log("[winhttp] WinHttpCheckPlatform -> unavailable (%s)\n", getenv("RT_NO_HTTP") ? "RT_NO_HTTP" : "Steam offline");
+    RET(!off);
+}
 // WinHttpOpen(agent, accessType, proxy, bypass, flags)
 void I_winhttp_dll_WinHttpOpen(CPU *c) {
     Hnd *h = calloc(1, sizeof *h); h->kind = K_SESSION; h->async = ((uint32_t)AN(4) & FLAG_ASYNC) != 0;

@@ -138,6 +138,7 @@ Translated game DLLs (video codecs, scripting engines…) are registered as modu
    | `cloud_save_dir`, `cloud_prefix` | Optional Steam Cloud sync of a save folder |
    | `image` | Optional executable image in the app's `Resources`, loaded instead of the game folder's exe (e.g. a DRM-free copy made at build time; `make_app.py --resource`) |
    | `gl_extensions` | OpenGL games: extra names for `GL_EXTENSIONS` the engine checks for |
+   | `steam_offline_logged_off`, `offline_no_http` | Opt-in, for when the Steam layer runs offline: `BLoggedOn` reports false (as Steam in offline mode does), and WinHTTP reports itself unavailable, so the game makes no web requests |
 
 3. Link the game's executable as `orig.exe`, then run `make kosmickrisp` (once), `make gen` and `make app`.
 4. Run `make fuzz`. It checks the translator against the original instructions, run under Rosetta as the
