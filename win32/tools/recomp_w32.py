@@ -1225,12 +1225,20 @@ class Translator:
             return False
         starts = {pe.entry}
         # code pointers in data
+        aligned = []   # 16-byte aligned code pointers that failed the boundary test: (table index, value)
+        words = []
         for name, va, vs, fo, fs, ch in pe.sections:
             if ch & 0x20000000 or name in (".rsrc", ".reloc", ".bind"): continue
             blob = pe.read(va, min(vs, fs) if fs else 0)
             for o in range(0, len(blob) - 3, 4):
                 v = struct.unpack_from("<I", blob, o)[0]
+                words.append(v)
                 if pe.text_lo <= v < pe.text_hi and boundary(v): starts.add(v)
+                elif pe.text_lo <= v < pe.text_hi and v % 16 == 0 and pe.is_code(v): aligned.append((len(words) - 1, v))
+        # an aligned code pointer next to known function pointers in the same table is a vtable entry too, even when
+        # no padding precedes the function (it can follow the previous function's inline switch table)
+        for i, v in aligned:
+            if (i > 0 and words[i - 1] in starts) or (i + 1 < len(words) and words[i + 1] in starts): starts.add(v)
         n_data = len(starts)
         # closure over direct calls / tail jumps / immediates, following each function's flow
         IMM = re.compile(r"0x([0-9a-f]{6,8})\b")
