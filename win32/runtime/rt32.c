@@ -491,6 +491,23 @@ static void process_init(void) {
 }
 
 char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
+// Launched from Finder or by Steam (stderr isn't a terminal): the log goes to ~/Library/Logs/<name>.log, with the
+// previous sessions' logs kept as <name>.prev.log to .prev4.log (as the 64-bit runtime does)
+void rt_log_to_file(const char *name) {
+    if (isatty(2)) return;
+    char log[1100], a[1100], b[1100];
+    snprintf(log, sizeof log, "%s/Library/Logs/%s.log", getenv("HOME") ? getenv("HOME") : "/tmp", name);
+    int stem = (int)(strlen(log) - 4);
+    for (int k = 4; k >= 2; k--) {   // prev3 -> prev4, prev2 -> prev3, prev -> prev2
+        if (k == 2) snprintf(a, sizeof a, "%.*s.prev.log", stem, log);
+        else snprintf(a, sizeof a, "%.*s.prev%d.log", stem, log, k - 1);
+        snprintf(b, sizeof b, "%.*s.prev%d.log", stem, log, k);
+        rename(a, b);
+    }
+    snprintf(a, sizeof a, "%.*s.prev.log", stem, log);
+    rename(log, a);
+    if (freopen(log, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+}
 void (*rt_guest_window_hook)(void *base, uint64_t size);
 int rt_game_main(int argc, char **argv);   // game.c: settings, then rt_run
 

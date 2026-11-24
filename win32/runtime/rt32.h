@@ -91,6 +91,7 @@ extern RtGame32 rt_game;
 // paths: Windows path in the game -> host path (backslashes, drive letters, the save folder)
 const char *rt_host_path(const char *win, char *out, size_t n);
 extern char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
+void rt_log_to_file(const char *name);   // not on a terminal: log to ~/Library/Logs/<name>.log (keeps 4 old ones)
 // set before rt_init: called once with the whole guest window while it is still mapped read/write and before anything
 // is protected (a GPU API can wrap it then, e.g. Metal's newBufferWithBytesNoCopy, which refuses PROT_NONE pages)
 extern void (*rt_guest_window_hook)(void *base, uint64_t size);
