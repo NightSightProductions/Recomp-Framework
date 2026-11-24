@@ -272,6 +272,10 @@ void call_ind_slow(CPU *c, uint32_t t) {
     char b[96];
     fprintf(stderr, "[rt] indirect call/jump to unknown address 0x%x (return address %s)\n", t, func_name(rds32(c->esp), b, sizeof b));
     guest_backtrace(c);
+    // after the game asked to quit (PostQuitMessage): a call through an object its teardown already freed, which
+    // Windows' heap usually lets slip by (freed memory keeps its contents for a while): end the process cleanly
+    extern volatile int rt_quitting;
+    if (rt_quitting && !(t >= gimage_base && t < gimage_base + gimage_size)) { fprintf(stderr, "[rt] the game is shutting down: exiting\n"); exit(0); }
     abort();
 }
 

@@ -152,7 +152,9 @@ SHIM(user32_TranslateMessage, 1) { return 0; }
 SHIM(user32_DispatchMessageW, 1) { uint32_t m = ARG(0); return send(c, rd32(m), rd32(m + 4), rd32(m + 8), rd32(m + 12)); }
 SHIM(user32_SendMessageA, 4) { if (trace_msg > 0) rt_log("[user32] SendMessageA(0x%x) from 0x%x", ARG(1), rd32(c->esp)); return send(c, ARG(0), ARG(1), ARG(2), ARG(3)); }
 SHIM(user32_SendMessageW, 4) { if (trace_msg > 0) rt_log("[user32] SendMessageW(0x%x) from 0x%x", ARG(1), rd32(c->esp)); return send(c, ARG(0), ARG(1), ARG(2), ARG(3)); }
+volatile int rt_quitting;   // the game asked to quit (rt32.c: lenient about its teardown)
 SHIM(user32_PostQuitMessage, 1) {
+    rt_quitting = 1;
     rt_log("[user32] PostQuitMessage(%d) from 0x%x", (int)ARG(0), rd32(c->esp));
     rt_post_message(0, 0x0012, ARG(0), 0); return 0;
 }

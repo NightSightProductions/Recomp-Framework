@@ -72,6 +72,7 @@ int rt_mouse_dx, rt_mouse_dy, rt_mouse_dz;
     l.framebufferOnly = NO;
     l.maximumDrawableCount = 3;
     l.contentsGravity = kCAGravityResizeAspect;   // fullscreen / resized: scale the game's frame, keep its aspect
+    l.backgroundColor = CGColorGetConstantColor(kCGColorBlack);   // the bars around it are black, like the screen's
     l.needsDisplayOnBoundsChange = NO;
     return l;
 }
@@ -156,6 +157,7 @@ void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h) {
         // scaling does)
         v.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;
         win.contentView = v;
+        win.backgroundColor = NSColor.blackColor;   // what shows around the game's aspect in fullscreen
         RtWindowDelegate *d = [RtWindowDelegate new]; d.hwnd = hwnd;
         win.delegate = d;
         objc_setAssociatedObject(win, "rtdelegate", d, OBJC_ASSOCIATION_RETAIN);
