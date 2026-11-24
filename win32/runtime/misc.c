@@ -69,9 +69,21 @@ SHIM(iphlpapi_GetIfEntry, 1) { return 50; }   // ERROR_NOT_SUPPORTED
 int gamepad_state(int user, uint8_t out[16], int guide);
 int gamepad_connected(int user);
 int gamepad_rumble(int user, uint16_t left, uint16_t right);
+// scripted runs (RT_AUTOKEYS pad keys, cocoa32.m): a controller in slot 0 whose buttons are rt_auto_pad, merged with a
+// real one if connected
+volatile uint16_t rt_auto_pad; int rt_auto_pad_on;
 SHIM(xinput1_4_ord2, 2) {   // XInputGetState(user, XINPUT_STATE *)
     uint8_t st[16];
-    if (!gamepad_state((int)ARG(0), st, 0)) return 1167;    // ERROR_DEVICE_NOT_CONNECTED
+    int real = gamepad_state((int)ARG(0), st, 0);
+    if (ARG(0) == 0 && rt_auto_pad_on) {
+        static uint32_t pkt; static uint16_t last;
+        if (!real) memset(st, 0, 16);
+        uint16_t b; memcpy(&b, st + 4, 2); b |= rt_auto_pad; memcpy(st + 4, &b, 2);
+        if (b != last) { last = b; pkt++; }
+        uint32_t pk; memcpy(&pk, st, 4); pk += pkt; memcpy(st, &pk, 4);
+        real = 1;
+    }
+    if (!real) return 1167;    // ERROR_DEVICE_NOT_CONNECTED
     if (ARG(1)) memcpy(G2H(ARG(1)), st, 16);
     return 0;
 }
@@ -80,7 +92,7 @@ SHIM(xinput1_4_ord3, 2) {   // XInputSetState(user, XINPUT_VIBRATION * {left, ri
     return gamepad_rumble((int)ARG(0), v ? rd16(v) : 0, v ? rd16(v + 2) : 0) ? 0 : 1167;
 }
 SHIM(xinput1_4_ord4, 3) {   // XInputGetCapabilities(user, flags, XINPUT_CAPABILITIES *): a full standard gamepad
-    if (!gamepad_connected((int)ARG(0))) return 1167;
+    if (!gamepad_connected((int)ARG(0)) && !(ARG(0) == 0 && rt_auto_pad_on)) return 1167;
     uint32_t p = ARG(2);
     if (p) {
         memset(G2H(p), 0, 20);

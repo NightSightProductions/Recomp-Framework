@@ -151,6 +151,10 @@ void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h) {
         win.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
         RtView *v = [[RtView alloc] initWithFrame:r];
         v.hwnd = hwnd; v.wantsLayer = YES;
+        // AppKit sets a layer-backed view's contentsGravity from layerContentsPlacement (default: stretch both axes);
+        // keep the game's aspect when the window or the fullscreen screen has another shape (black bars, as Windows
+        // scaling does)
+        v.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;
         win.contentView = v;
         RtWindowDelegate *d = [RtWindowDelegate new]; d.hwnd = hwnd;
         win.delegate = d;
@@ -229,8 +233,122 @@ void rt_cocoa_screen_size(int *w, int *h) {
     else dispatch_sync(dispatch_get_main_queue(), ^{ s = NSScreen.mainScreen.frame.size; });
     *w = (int)s.width; *h = (int)s.height;
 }
+// the largest screen in pixels (Retina backing size): the desktop mode D3D-era games cap their mode lists at
+void rt_cocoa_screen_pixels(int *w, int *h) {
+    __block int bw = 0, bh = 0;
+    void (^get)(void) = ^{
+        for (NSScreen *sc in NSScreen.screens) {
+            int x = (int)(sc.frame.size.width * sc.backingScaleFactor), y = (int)(sc.frame.size.height * sc.backingScaleFactor);
+            if ((long)x * y > (long)bw * bh) { bw = x; bh = y; }
+        }
+    };
+    if ([NSThread isMainThread]) get(); else dispatch_sync(dispatch_get_main_queue(), get);
+    if (!bw) rt_cocoa_screen_size(&bw, &bh);
+    *w = bw; *h = bh;
+}
+
+// ---- automation, for scripted runs (benchmarks): RT_AUTOKEYS="<seconds>:<key>[,...]" presses keys at those times
+// after launch, with the game window brought to the front. Keys: ret esc space up down left right, or a macOS key
+// code number; key/ms holds it that long (default 150). Controller buttons (slot 0): a b x y start back pup pdown
+// pleft pright. Some game dialogs only take keys that come from outside the process (System Events); a script can
+// wait for the "[auto] saved data read" log line and send those itself.
+static void autokey_internal(unsigned short code, int down);
+// real key events, posted to this process (they take the normal keyboard path: AppKit -> the view -> DirectInput state
+// and window messages); RT_AUTOKEYS_INTERNAL=1 injects into that path directly instead
+static void autokey(unsigned short code, int down) {
+    static int internal = -1; if (internal < 0) internal = getenv("RT_AUTOKEYS_INTERNAL") != NULL;
+    if (down && windows.count) {
+        extern uint64_t rt_last_surface_hwnd;
+        NSWindow *w = rt_last_surface_hwnd && windows[@((uint32_t)rt_last_surface_hwnd)] ? windows[@((uint32_t)rt_last_surface_hwnd)] : windows[[windows.allKeys firstObject]];
+        if (!NSApp.isActive) [NSApp activateIgnoringOtherApps:YES];
+        if (!w.isKeyWindow) [w makeKeyAndOrderFront:nil];
+    }
+    if (internal) { autokey_internal(code, down); return; }
+    CGEventRef ev = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)code, down ? true : false);
+    if (!ev) { autokey_internal(code, down); return; }
+    CGEventPostToPid(getpid(), ev);
+    CFRelease(ev);
+}
+static void autokey_internal(unsigned short code, int down) {
+    uint8_t dik = dik_of(code), vk = vk_of(code);
+    if (down && windows.count) {   // games ignore keys while inactive: scripted runs take the focus
+        extern uint64_t rt_last_surface_hwnd;
+        NSWindow *w = rt_last_surface_hwnd && windows[@((uint32_t)rt_last_surface_hwnd)] ? windows[@((uint32_t)rt_last_surface_hwnd)] : windows[[windows.allKeys firstObject]];
+        if (!NSApp.isActive) [NSApp activateIgnoringOtherApps:YES];
+        if (!w.isKeyWindow) [w makeKeyAndOrderFront:nil];
+    }
+    if (dik) rt_dinput_key(dik, down);
+    if (!vk || !windows.count) return;
+    extern uint64_t rt_last_surface_hwnd;   // the window the game renders to (the one it reads messages for)
+    uint32_t hwnd = rt_last_surface_hwnd && windows[@((uint32_t)rt_last_surface_hwnd)] ? (uint32_t)rt_last_surface_hwnd : (uint32_t)[[windows.allKeys firstObject] unsignedIntValue];
+    rt_keys[vk] = (uint8_t)down;
+    rt_post_message(hwnd, down ? 0x0100 : 0x0101, vk, 1u | ((uint32_t)code << 16) | (down ? 0 : 3u << 30));
+}
+static void autokeys_schedule(const char *e);
+// RT_AUTO_UNTIL_LOAD=<key>[/<seconds>]: press it every few seconds (default 2) until the game first reads its saved
+// data (rt_auto_event("load"), steam32.c), then RT_AUTOKEYS_AFTER_LOAD runs with times relative to that moment:
+// menus timed from an event in the game, not from launch.
+static volatile int auto_loaded;
+void rt_auto_event(const char *what) {
+    if (strcmp(what, "load") || auto_loaded) return;
+    auto_loaded = 1;
+    const char *e = getenv("RT_AUTOKEYS_AFTER_LOAD");
+    if (e || getenv("RT_AUTO_UNTIL_LOAD")) rt_log("[auto] saved data read");   // scripts can wait for this line
+    if (e) dispatch_async(dispatch_get_main_queue(), ^{ autokeys_schedule(e); });
+}
+static void auto_until_load(unsigned short code, double every) {
+    if (auto_loaded) return;
+    autokey(code, 1);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ autokey(code, 0); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(every * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ auto_until_load(code, every); });
+}
+static void autokeys_start(void) {
+    const char *u = getenv("RT_AUTO_UNTIL_LOAD");
+    if (u) {
+        double every = 2; const char *sl = strchr(u, '/'); if (sl) every = atof(sl + 1);
+        unsigned short code = !strncmp(u, "ret", 3) ? 36 : !strncmp(u, "space", 5) ? 49 : (unsigned short)atoi(u);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ auto_until_load(code, every); });
+    }
+    const char *e = getenv("RT_AUTOKEYS");
+    if (e) autokeys_schedule(e);
+}
+static void autokeys_schedule(const char *e) {
+    char *list = strdup(e), *save = NULL;
+    for (char *t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        double at = atof(t); char *k = strchr(t, ':'); if (!k) continue; k++;
+        double hold = 0.15; char *hs = strchr(k, '/'); if (hs) { *hs = 0; hold = atof(hs + 1) / 1000.0; }   // key/ms: hold time
+        static const struct { const char *n; uint16_t b; } pad[] = {{"a", 0x1000}, {"b", 0x2000}, {"x", 0x4000}, {"y", 0x8000},
+            {"start", 0x10}, {"back", 0x20}, {"pup", 0x1}, {"pdown", 0x2}, {"pleft", 0x4}, {"pright", 0x8}};
+        uint16_t pb = 0; for (unsigned i = 0; i < sizeof pad / sizeof *pad; i++) if (!strcmp(k, pad[i].n)) pb = pad[i].b;
+        if (pb) {   // controller buttons (misc.c: a virtual controller in slot 0)
+            extern volatile uint16_t rt_auto_pad; extern int rt_auto_pad_on;
+            rt_auto_pad_on = 1;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(at * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ rt_auto_pad |= pb; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((at + hold) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ rt_auto_pad &= (uint16_t)~pb; });
+            continue;
+        }
+        unsigned short code = !strcmp(k, "ret") ? 36 : !strcmp(k, "esc") ? 53 : !strcmp(k, "space") ? 49 : !strcmp(k, "up") ? 126 :
+                              !strcmp(k, "down") ? 125 : !strcmp(k, "left") ? 123 : !strcmp(k, "right") ? 124 : (unsigned short)atoi(k);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(at * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ autokey(code, 1); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((at + hold) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ autokey(code, 0); });
+    }
+    free(list);
+}
 
 // ---- app ----
+// Quit (Cmd-Q) asks the game to close, as its window's close button does (WM_CLOSE), so it shuts down and saves the
+// way it does on Windows; a second Quit while it hasn't exited ends the process.
+@interface RtAppDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation RtAppDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    static int asked;
+    if (asked++ || !windows.count) return NSTerminateNow;
+    for (NSNumber *h in windows) rt_post_message(h.unsignedIntValue, 0x0010, 0, 0);   // WM_CLOSE
+    return NSTerminateCancel;
+}
+@end
+static RtAppDelegate *app_delegate;
 static void (*game_main)(void);
 static void *game_thread(void *p) { (void)p; game_main(); return NULL; }
 
@@ -244,8 +362,10 @@ void rt_cocoa_run(void (*fn)(void)) {
         fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
         [app addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
         NSApp.mainMenu = bar;
+        app_delegate = [RtAppDelegate new]; NSApp.delegate = app_delegate;
         [NSApp finishLaunching];
         { extern void gamepad_start(void); gamepad_start(); }   // controllers are known before the game first asks
+        autokeys_start();
         game_main = fn;
         pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
         pthread_attr_setstacksize(&a, 256u << 20);   // translated frames are large; the guest recurses deeply at load
@@ -278,7 +398,8 @@ int rt_cocoa_display_modes(int *w, int *h, int max) {
         }
         if (modes) CFRelease(modes);
     }
-    static const int std16x9[][2] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160}};
+    static const int std16x9[][2] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160},
+        {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1200}, {2560, 1600}};   // and the common 16:10 sizes
     for (unsigned i = 0; i < sizeof std16x9 / sizeof *std16x9; i++)
         if (std16x9[i][0] <= maxw && std16x9[i][1] <= maxh) add(std16x9[i][0], std16x9[i][1]);
     for (int i = 1; i < n; i++)   // by area, then width

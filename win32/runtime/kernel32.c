@@ -543,6 +543,8 @@ SHIM(kernel32_GetPrivateProfileStringA, 6) {
     char p[1024], v[1024] = "";
     rt_host_path(STR(5), p, sizeof p);
     FILE *f = fopen(p, "r");
+    if (trace_files < 0) trace_files = getenv("RT_TRACE_FILES") != NULL;
+    if (trace_files) rt_log("[file] GetPrivateProfileString [%s] %s in %s (%s)", sec ? sec : "", key ? key : "", STR(5), f ? "found file" : strerror(errno));
     int found = f && sec && key && ini_find(f, sec, key, v, sizeof v);
     if (f) fclose(f);
     if (!found) snprintf(v, sizeof v, "%s", def ? def : "");
@@ -554,6 +556,8 @@ SHIM(kernel32_GetPrivateProfileStringA, 6) {
 SHIM(kernel32_WritePrivateProfileStringA, 4) {
     const char *sec = STR(0), *key = STR(1), *val = STR(2);
     char p[1024]; rt_host_path(STR(3), p, sizeof p);
+    if (trace_files < 0) trace_files = getenv("RT_TRACE_FILES") != NULL;
+    if (trace_files) rt_log("[file] WritePrivateProfileString [%s] %s=%s in %s -> %s", sec ? sec : "", key ? key : "", val ? val : "", STR(3), p);
     FILE *f = fopen(p, "r");
     char *buf = NULL; size_t len = 0;
     if (f) { fseek(f, 0, SEEK_END); len = (size_t)ftell(f); fseek(f, 0, SEEK_SET); buf = malloc(len + 1); len = fread(buf, 1, len, f); buf[len] = 0; fclose(f); }

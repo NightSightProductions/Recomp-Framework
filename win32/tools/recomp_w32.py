@@ -1277,7 +1277,12 @@ class Translator:
                     else:
                         for m_ in IMM.finditer(opst):
                             v = int(m_.group(1), 16)
-                            if (mn in ("push", "mov", "lea") and pe.text_lo <= v < pe.text_hi and boundary(v)) and v not in starts:
+                            if mn not in ("push", "mov", "lea") or not pe.text_lo <= v < pe.text_hi or v in starts: continue
+                            # a plain immediate (not inside a memory operand) that is 16-byte aligned code: a function
+                            # pointer being stored (vtable set up in a constructor), even when no padding precedes it
+                            # (it can follow the previous function's inline switch table)
+                            plain = "[" not in opst[:m_.start()] or "]" in opst[:m_.start()]
+                            if boundary(v) or (plain and v % 16 == 0 and pe.is_code(v)):
                                 starts.add(v); work.append(v)
                     if mn in ("ret", "retf", "jmp", "int3", "ud2", "hlt") or (mn == "int" and opst == "0x29"):
                         break

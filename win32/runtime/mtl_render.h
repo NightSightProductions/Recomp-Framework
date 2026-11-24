@@ -115,3 +115,26 @@ enum {   // MTLVertexFormat
 // MTLSamplerBorderColor 0 transparent black 1 opaque black 2 opaque white
 void mtlr_debug_dump(const char *dir);  // RT_METAL_DUMP: write render targets as images
 void mtlr_tex_download(MtlTex t, int face, int level, void *dst, uint32_t pitch);   // waits for the GPU
+// cost since the last call: pipeline creation (ms, count) and the wait for a drawable (ms)
+void mtlr_frame_stats(double *pso_ms, int *pso_n, double *drawable_ms);
+// build the pipelines recorded by earlier runs (<data dir>/pipelines_v2.bin) in the background; after mtlr_load_shaders
+void mtlr_prewarm(void);
+// speculative pipelines: when the game loads a shader pair (+ its vertex layout), build it in the background against
+// the target/blend setup of that rank by use so far (0: the most used); queue rank 0 for everything first, then rank 1..
+// mtlr_speculate_config seeds a setup (weight: prior use count)
+void mtlr_speculate(uint32_t vs, uint32_t ps, uint32_t layout, int rank);
+void mtlr_speculate_config(const uint32_t color[4], uint32_t depth, int alpha_test, const MtlBlend blend[4], uint32_t weight);
+int mtlr_speculated(void);   // background builds started so far
+// look-ahead: between begin and end the state setters and draws only start the pipelines those draws will need
+// (nothing is encoded; the state is restored at end); replay the frame once like that, then for real. end returns
+// how many builds it started.
+void mtlr_lookahead_begin(void);
+int mtlr_lookahead_end(void);
+double mtlr_gpu_ms(void);   // GPU time of the command buffers completed since the last call (ms)
+// buffer hazards (D3D9 lock semantics): mtlr_seq_now is the command buffer the current draws go into; mtlr_wait_seq
+// returns once the GPU finished it (a lock without DISCARD / NOOVERWRITE of a buffer the GPU may still read)
+uint64_t mtlr_seq_now(void);
+void mtlr_wait_seq(uint64_t seq);
+// shaders as Metal source batches (mtlr_load_shaders given a folder of batch_*.metal): wait until all are compiled
+void mtlr_wait_shaders(void);
+int mtlr_init_shaders_only(void);   // the Metal device only: load and compile shaders without a game (returns 0 without Metal)

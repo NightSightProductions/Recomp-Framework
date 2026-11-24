@@ -67,6 +67,29 @@ void utf8_to_w(const char *s, uint16_t *out, size_t n) {
 RtGame32 rt_game = {"Game", "game.exe", "C:\\Games\\Game", "C:\\Users\\Player\\Documents", "orig.exe", 0};
 
 // ---- paths ----
+// Windows paths are in the game's ANSI code page; macOS file names must be UTF-8. Valid UTF-8 (ASCII included) is
+// kept; otherwise bytes map as Shift-JIS's full-width space (0x81 0x40, which Japanese-made games put in folder names)
+// and Latin-1 for the rest, the same way every time (reads find what writes made).
+static int valid_utf8(const unsigned char *p) {
+    while (*p) {
+        int n = *p < 0x80 ? 0 : (*p >> 5) == 6 ? 1 : (*p >> 4) == 14 ? 2 : (*p >> 3) == 30 ? 3 : -1;
+        if (n < 0) return 0;
+        p++;
+        for (int i = 0; i < n; i++, p++) if ((*p & 0xC0) != 0x80) return 0;
+    }
+    return 1;
+}
+static void ansi_to_utf8(const char *in, char *out, size_t n) {
+    const unsigned char *p = (const unsigned char *)in;
+    if (valid_utf8(p)) { snprintf(out, n, "%s", in); return; }
+    size_t o = 0;
+    for (; *p && o + 4 < n; p++) {
+        if (*p < 0x80) out[o++] = (char)*p;
+        else if (p[0] == 0x81 && p[1] == 0x40) { out[o++] = (char)0xE3; out[o++] = (char)0x80; out[o++] = (char)0x80; p++; }   // U+3000
+        else { out[o++] = (char)(0xC0 | (*p >> 6)); out[o++] = (char)(0x80 | (*p & 0x3F)); }
+    }
+    out[o] = 0;
+}
 // The game opens files relative to its folder (nativePC\...), and its saves through SHGetFolderPath; drive
 // letters map to the game folder (C:\ -> /) only for absolute paths the game built from GetCurrentDirectory.
 const char *rt_host_path(const char *win, char *out, size_t n) {
@@ -80,6 +103,6 @@ const char *rt_host_path(const char *win, char *out, size_t n) {
     }
     if (s) { for (; *s && k + 1 < sizeof tmp; s++) tmp[k++] = *s; tmp[k] = 0; }
     for (char *p = tmp; *p; p++) if (*p == '\\') *p = '/';
-    snprintf(out, n, "%s", tmp);
+    ansi_to_utf8(tmp, out, n);
     return out;
 }

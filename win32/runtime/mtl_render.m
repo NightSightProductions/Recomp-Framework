@@ -4,6 +4,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@ id<MTLDevice> rt_metal_device(void);
 void *rt_window_layer(uint32_t hwnd);
 void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h);
 
-#define FRAMES 2                       // frames in flight
+#define FRAMES 3                       // frames in flight
 #define RING (24u << 20)               // per-frame upload ring (constants)
 #define NTEX 65536
 
@@ -37,6 +38,13 @@ static void wrap_guest(void *base, uint64_t size) {
     rt_log("[mtl] %s, guest window wrapped (%llu MiB max buffer)", dev.name.UTF8String, (unsigned long long)(dev.maxBufferLength >> 20));
 }
 void mtlr_init(void) { rt_guest_window_hook = wrap_guest; }
+// only the device, for tools that load shaders without running a game (an installer compiling them once)
+int mtlr_init_shaders_only(void) {
+    dev = rt_metal_device();
+    if (!dev) return 0;
+    active = 1;
+    return 1;
+}
 int mtlr_active(void) { return active; }
 int mtlr_shadow(void) {
     if (shadow_on < 0) {
@@ -67,11 +75,19 @@ static const char *builtin_src =
     "  return float4(mix(lut[k.r].r, lut[k1.r].r, f.r), mix(lut[k.g].g, lut[k1.g].g, f.g), mix(lut[k.b].b, lut[k1.b].b, f.b), c.a); }\n"
     "fragment float4 blit_ps(BV i [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { return t.sample(s, i.t); }\n";
 
+static void load_source_batches(const char *dir);
+static NSMutableDictionary<NSString *, id<MTLLibrary>> *src_lib;
+static NSMutableDictionary<NSString *, NSString *> *src_qual;
+static int src_pending;
 void mtlr_load_shaders(const char *path, const Sm3ShaderInfo *table, int n) {
     if (!active) return;
     NSError *err = nil;
-    lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&err];
-    if (!lib) rt_fatal("[mtl] can't load %s: %s", path, err.localizedDescription.UTF8String);
+    BOOL isdir = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:@(path) isDirectory:&isdir] && isdir) load_source_batches(path);
+    else {
+        lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&err];
+        if (!lib) rt_fatal("[mtl] can't load %s: %s", path, err.localizedDescription.UTF8String);
+    }
     builtin = [dev newLibraryWithSource:@(builtin_src) options:nil error:&err];
     if (!builtin) rt_fatal("[mtl] builtin shaders: %s", err.localizedDescription.UTF8String);
     Sm3ShaderInfo *t = malloc(sizeof *t * (size_t)n); memcpy(t, table, sizeof *t * (size_t)n);
@@ -89,6 +105,45 @@ static pthread_cond_t shader_cv = PTHREAD_COND_INITIALIZER;   // a run-time comp
 static NSMutableDictionary<NSString *, NSNumber *> *pending;   // run-time compiles in flight
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *dyn_libs;   // the library of each run-time compiled shader
 static NSMutableDictionary<NSString *, id<MTLFunction>> *no_alpha;  // pixel functions specialized without alpha test
+static double now_ms_early(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+// Shaders as Metal source (no offline Metal compiler at build time: tools/msl_batches.py): a folder of batch_*.metal,
+// each holding many shaders in namespaces of their own (their functions are "bN::<name>"). They're compiled in the
+// background at startup, all batches at once; a function waits only while batches are still compiling. macOS caches
+// compiled source, so this costs about a minute once (an installer can do it: mtlr_wait_shaders) and nothing after.
+// src_lib: plain function name -> its batch's library; src_qual: -> "bN::name"
+static double src_t0;
+static void load_source_batches(const char *dir) {
+    NSArray *files = [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:@(dir) error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    src_lib = [NSMutableDictionary new]; src_qual = [NSMutableDictionary new];
+    src_t0 = now_ms_early();
+    NSMutableArray<NSString *> *batches = [NSMutableArray new], *names = [NSMutableArray new];
+    for (NSString *f in files) {
+        if (![f hasPrefix:@"batch_"] || ![f hasSuffix:@".metal"]) continue;
+        NSString *src = [NSString stringWithContentsOfFile:[@(dir) stringByAppendingPathComponent:f] encoding:NSUTF8StringEncoding error:nil];
+        if (src) { [batches addObject:src]; [names addObject:f]; }
+    }
+    pthread_mutex_lock(&shader_mu); src_pending = (int)batches.count; pthread_mutex_unlock(&shader_mu);   // all counted first:
+    rt_log("[mtl] compiling %d shader source batches from %s", src_pending, dir);                      // cached ones finish at once
+    for (NSUInteger i = 0; i < batches.count; i++) {
+        NSString *src = batches[i], *f = names[i];
+        [dev newLibraryWithSource:src options:[MTLCompileOptions new] completionHandler:^(id<MTLLibrary> l, NSError *e) {
+            pthread_mutex_lock(&shader_mu);
+            if (l) for (NSString *q in l.functionNames) {
+                NSRange r = [q rangeOfString:@"::" options:NSBackwardsSearch];
+                NSString *plain = r.location == NSNotFound ? q : [q substringFromIndex:r.location + 2];
+                src_lib[plain] = l; src_qual[plain] = q;
+            } else rt_log("[mtl] %s: %s", f.UTF8String, e.localizedDescription.UTF8String);
+            if (--src_pending == 0) rt_log("[mtl] shader sources compiled (%.1f s)", (now_ms_early() - src_t0) / 1000);
+            pthread_cond_broadcast(&shader_cv);
+            pthread_mutex_unlock(&shader_mu);
+        }];
+    }
+}
+void mtlr_wait_shaders(void) {
+    pthread_mutex_lock(&shader_mu);
+    while (src_pending > 0) pthread_cond_wait(&shader_cv, &shader_mu);
+    pthread_mutex_unlock(&shader_mu);
+}
 const Sm3ShaderInfo *mtlr_shader_info(uint32_t hash) {
     int lo = 0, hi = nshaders - 1;     // sorted by hash at load
     while (lo <= hi) { int m = (lo + hi) / 2; if (shaders[m].hash == hash) return &shaders[m]; if (shaders[m].hash < hash) lo = m + 1; else hi = m - 1; }
@@ -103,7 +158,12 @@ static id<MTLFunction> function(const Sm3ShaderInfo *s) {
     NSString *k = @(s->function);
     pthread_mutex_lock(&shader_mu);
     id<MTLFunction> f = functions[k];
-    if (!f) { f = [lib newFunctionWithName:k]; if (f) functions[k] = f; }
+    if (!f && lib) { f = [lib newFunctionWithName:k]; if (f) functions[k] = f; }
+    while (!f && src_lib) {   // source batches: its batch may still be compiling
+        if (src_lib[k]) { f = [src_lib[k] newFunctionWithName:src_qual[k]]; if (f) functions[k] = f; break; }
+        if (src_pending <= 0) break;
+        pthread_cond_wait(&shader_cv, &shader_mu);
+    }
     while (!f && functions[k] == nil && pending[k]) { pthread_cond_wait(&shader_cv, &shader_mu); f = functions[k]; }   // compiling
     pthread_mutex_unlock(&shader_mu);
     if (!f) { static int n; if (n++ < 20) rt_log("[mtl] no function %s", s->function); }
@@ -117,14 +177,15 @@ static id<MTLFunction> function_no_alpha(const Sm3ShaderInfo *s) {
     pthread_mutex_lock(&shader_mu);
     if (!no_alpha) no_alpha = [NSMutableDictionary new];
     id<MTLFunction> f = no_alpha[k];
-    id<MTLLibrary> l = dyn_libs[k] ?: lib;
+    id<MTLLibrary> l = dyn_libs[k] ?: src_lib[k] ?: lib;
+    NSString *qn = src_qual[k] ?: k;
     pthread_mutex_unlock(&shader_mu);
     if (f) return f;
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
     bool off = false;
     [cv setConstantValue:&off type:MTLDataTypeBool atIndex:SM3_FC_ALPHA_TEST];
     NSError *e = nil;
-    f = [l newFunctionWithName:k constantValues:cv error:&e];
+    f = [l newFunctionWithName:qn constantValues:cv error:&e];
     if (!f) { rt_log("[mtl] %s without alpha test: %s", s->function, e.localizedDescription.UTF8String); return base; }
     pthread_mutex_lock(&shader_mu); no_alpha[k] = f; pthread_mutex_unlock(&shader_mu);
     return f;
@@ -241,7 +302,9 @@ MtlTex mtlr_tex_create(const MtlTexDesc *d) {
     pthread_mutex_unlock(&tex_mu);
     return h;
 }
+static void pend_drop(MtlTex h);
 void mtlr_tex_destroy(MtlTex h) {
+    pend_drop(h);
     pthread_mutex_lock(&tex_mu);
     Tex *x = tget(h);
     if (x) { x->tex = nil; x->sample = nil; x->srgb = nil; x->target_srgb = nil; }
@@ -290,8 +353,12 @@ static void queue_upload(Tex *x, int face, int level, MTLRegion r, const void *d
     ups[nups++] = (Upload){x->tex, (__bridge void *)b, face, level, r, pitch, slice};
     pthread_mutex_unlock(&up_mu);
 }
+static int npend_any(void);
+static void pend_flush_uploads(void);
+static void pend_flush(MtlTex t);
 static void flush_uploads(id<MTLCommandBuffer> cb) {
     if (!__atomic_load_n(&nups, __ATOMIC_ACQUIRE)) return;
+    if (npend_any()) pend_flush_uploads();   // a pending clear of an upload's texture comes first
     pthread_mutex_lock(&up_mu);
     if (nups) {
         id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
@@ -365,9 +432,24 @@ void mtlr_set_window(uint32_t hwnd, int w, int h) {
 }
 MtlTex mtlr_backbuffer(void) { return backbuf; }
 
-static void end_encoder(void) { if (enc) { [enc endEncoding]; enc = nil; } }
+// debug RT_METAL_PASSES=1: log the passes of one frame in 600 (attachments, draws, whether any draw used depth)
+static int pass_log, pass_draws, pass_depth_used, pass_clear; static char pass_desc[256];
+static id<MTLCounterSampleBuffer> pass_cs; static int pass_n; static char pass_descs[64][300];
+static int getenv_cached_noclear_defer(void) { static int v = -1; if (v < 0) v = getenv("RT_METAL_NO_CLEAR_DEFER") != NULL; return v; }
+static void depth_learn(void);
+static void pass_dend(void);
+static void end_encoder(void) {
+    if (enc) {
+        [enc endEncoding]; enc = nil;
+        depth_learn();
+        pass_dend();
+        if (pass_log && pass_n > 0 && pass_n <= 64) snprintf(pass_descs[pass_n - 1], sizeof pass_descs[0], "%s draws %d depth-used %d clear %d", pass_desc, pass_draws, pass_depth_used, pass_clear);
+    }
+}
+static pthread_t enc_thread;   // the thread encoding (ensure_cmd)
 static void ensure_cmd(void) {
     if (cmd) return;
+    enc_thread = pthread_self();
     dispatch_semaphore_wait(inflight, DISPATCH_TIME_FOREVER);
     cmd = [queue commandBuffer];
     flush_uploads(cmd);
@@ -420,9 +502,40 @@ static void gamma_to(id<MTLTexture> dst, id<MTLTexture> src) {
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
+static uint32_t frame_no;   // frames presented (scratch depth)
 static void commit_cmd(void);
+// per-frame cost counters (mtlr_frame_stats)
+static double fs_pso_ms, fs_drawable_ms; static int fs_pso_n;
+static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+void mtlr_frame_stats(double *pso_ms, int *pso_n, double *drawable_ms) {
+    *pso_ms = fs_pso_ms; *pso_n = fs_pso_n; *drawable_ms = fs_drawable_ms;
+    fs_pso_ms = fs_drawable_ms = 0; fs_pso_n = 0;
+}
 void mtlr_present(int interval) {
     if (!active || !backbuf) return;
+    pend_flush(backbuf);
+    frame_no++;
+    { static int f, on = -1, report; if (on < 0) on = getenv("RT_METAL_PASSES") != NULL; f++;
+      if (on) {
+        if (report) {   // the logged frame's command buffers are done by now: per pass GPU time from the timestamps
+            report = 0;
+            if (last_committed) [last_committed waitUntilCompleted];
+            NSData *d = pass_cs ? [pass_cs resolveCounterRange:NSMakeRange(0, 4 * (NSUInteger)MIN(pass_n, 64))] : nil;
+            const MTLCounterResultTimestamp *t = d ? d.bytes : NULL;
+            uint64_t base = UINT64_MAX;
+            for (int i = 0; i < pass_n && i < 64 && t; i++) for (int j = 0; j < 4; j++) if (t[4 * i + j].timestamp != MTLCounterErrorValue && t[4 * i + j].timestamp && t[4 * i + j].timestamp < base) base = t[4 * i + j].timestamp;
+            for (int i = 0; i < pass_n && i < 64; i++) {
+                double v0 = -1, v1 = -1, f0 = -1, f1 = -1;
+                #define TS(k, out) if (t && t[4 * i + k].timestamp != MTLCounterErrorValue && t[4 * i + k].timestamp) out = (double)(t[4 * i + k].timestamp - base) / 1000.0
+                TS(0, v0); TS(1, v1); TS(2, f0); TS(3, f1);
+                #undef TS
+                rt_log("[pass] %2d vtx %7.0f-%7.0f frag %7.0f-%7.0f us (%5.0f)  %s", i, v0, v1, f0, f1, f1 - f0, pass_descs[i]);
+            }
+            rt_log("[pass] ---- %d passes", pass_n);
+        }
+        if (pass_log) { end_encoder(); report = 1; }
+        pass_log = f % 600 == 0; if (pass_log) pass_n = 0;
+      } }
     ensure_cmd();
     end_encoder();
     flush_uploads(cmd);
@@ -435,7 +548,9 @@ void mtlr_present(int interval) {
         BOOL sync = interval != 0;
         if (layer.displaySyncEnabled != sync) layer.displaySyncEnabled = sync;
     }
+    double td = now_ms();
     id<CAMetalDrawable> dr = [layer nextDrawable];
+    fs_drawable_ms += now_ms() - td;
     if (!dr) { static int n; if (n++ < 5) rt_log("[mtl] present: no drawable (layer %p)", (__bridge void *)layer); }
     if (dr) {
         Tex *b = tget(backbuf);
@@ -449,17 +564,20 @@ void mtlr_present(int interval) {
         [cmd presentDrawable:dr];
     }
     commit_cmd();
-    if (++dbg[6] % 120 == 0) rt_log("[mtl] last 120 frames: draws %d, no encoder %d, no pipeline %d, passes %d, clears %d+%d",
-                                     dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5]);
+    if (++dbg[6] % 120 == 0) rt_log("[mtl] last 120 frames: draws %d, no encoder %d, no pipeline %d, passes %d, clears %d+%d, loads skipped %d",
+                                     dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[7]);
     if (dbg[6] % 120 == 0) memset(dbg, 0, sizeof dbg);
 }
 // fences: a GPU sync point the CPU can poll (D3D event queries). Command buffers are numbered as committed.
 static uint64_t committed_seq, completed_seq;
+static pthread_mutex_t gpu_mu = PTHREAD_MUTEX_INITIALIZER; static double gpu_ms;   // GPU time of completed command buffers
+double mtlr_gpu_ms(void) { pthread_mutex_lock(&gpu_mu); double g = gpu_ms; gpu_ms = 0; pthread_mutex_unlock(&gpu_mu); return g; }
 static void commit_cmd(void) {
     if (!cmd) return;
     end_encoder();
     uint64_t seq = ++committed_seq;
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        double g = (b.GPUEndTime - b.GPUStartTime) * 1e3; if (g > 0) { pthread_mutex_lock(&gpu_mu); gpu_ms += g; pthread_mutex_unlock(&gpu_mu); }
         uint64_t c = __atomic_load_n(&completed_seq, __ATOMIC_ACQUIRE);
         while (c < seq && !__atomic_compare_exchange_n(&completed_seq, &c, seq, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
     }];
@@ -467,6 +585,20 @@ static void commit_cmd(void) {
     last_committed = cmd; cmd = nil;
 }
 uint64_t mtlr_fence(void) { if (!active) return 0; commit_cmd(); return committed_seq; }
+// buffer hazards: the command buffer being encoded gets seq committed_seq + 1
+uint64_t mtlr_seq_now(void) { return committed_seq + 1; }
+void mtlr_wait_seq(uint64_t s) {
+    if (!active || !s || mtlr_fence_done(s)) return;
+    if (s > committed_seq) {
+        if (cmd && pthread_equal(pthread_self(), enc_thread)) commit_cmd();   // ours: send it now
+        // else the encoding thread commits it at its next present
+    }
+    double t0 = now_ms();
+    while (!mtlr_fence_done(s)) {
+        if (now_ms() - t0 > 200) { static int n; if (n++ < 5) rt_log("[mtl] buffer still in use by the GPU after 200 ms (seq %llu)", (unsigned long long)s); return; }
+        usleep(20);
+    }
+}
 int mtlr_fence_done(uint64_t f) { return __atomic_load_n(&completed_seq, __ATOMIC_ACQUIRE) >= f; }
 void mtlr_wait_idle(void) {
     commit_cmd();
@@ -552,7 +684,7 @@ typedef struct {
     uint32_t vs, ps, layout;
     uint32_t color[4], depth; uint8_t samples, srgb_mask, alpha_test, pad;
     MtlBlend blend[4];
-    uint32_t strides[16]; uint8_t rates[16];
+    uint32_t strides[16]; uint8_t rates[16];   // strides: 1 = stream bound (the stride itself is dynamic, set per draw)
 } PsoKey;
 
 static MTLVertexFormat zero_attr_format(void) { return MTLVertexFormatFloat4; }
@@ -570,10 +702,7 @@ static MTLVertexFormat bound_format(uint8_t f, float *scale) {
 }
 static id<MTLBuffer> zero_buf;
 
-static id<MTLRenderPipelineState> pipeline(const PsoKey *k) {
-    uint64_t h = fnv(k, sizeof *k);
-    id<MTLRenderPipelineState> p = (__bridge id<MTLRenderPipelineState>)map_get(&pso_map, k, sizeof *k, h);
-    if (p) return p;
+static MTLRenderPipelineDescriptor *pso_desc(const PsoKey *k) {
     const Sm3ShaderInfo *vs = mtlr_shader_info(k->vs), *ps = mtlr_shader_info(k->ps);
     if (!vs || !ps) return nil;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -606,7 +735,7 @@ static id<MTLRenderPipelineState> pipeline(const PsoKey *k) {
         }
     }
     for (int s = 0; s < 15; s++) if (used_streams & (1 << s)) {
-        vd.layouts[s].stride = k->strides[s];
+        vd.layouts[s].stride = MTLBufferLayoutStrideDynamic;   // setVertexBuffer:...attributeStride: per draw
         vd.layouts[s].stepFunction = k->rates[s] ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
         vd.layouts[s].stepRate = k->rates[s] ? k->rates[s] : 1;
     }
@@ -625,10 +754,228 @@ static id<MTLRenderPipelineState> pipeline(const PsoKey *k) {
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth;
     if (k->depth == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->depth;
     d.rasterSampleCount = k->samples ? k->samples : 1;
+    return d;
+}
+
+// Pipeline cache. Building a pipeline compiles its shaders for the GPU (10-120 ms each, cold), so every key is also
+// recorded in <data dir>/pipelines_v2.bin and the next launch builds them all in the background (mtlr_prewarm) before
+// the game asks for them. pso_map is shared with the compile completion handlers (pso_mu); pso_state marks keys
+// built in the background: 1 queued, 3 compiling, 2 done.
+typedef struct { PsoKey k; int32_t n; MtlVertexElement e[32]; } PsoRecord;
+static pthread_mutex_t pso_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pso_cv = PTHREAD_COND_INITIALIZER;
+static Map pso_state;
+static FILE *pso_file;
+static void map_set(Map *m, const void *k, uint32_t n, uint64_t h, void *v) {
+    for (uint32_t i = m->cap ? (uint32_t)h & (m->cap - 1) : 0; m->cap && m->e[i].key; i = (i + 1) & (m->cap - 1))
+        if (m->e[i].h == h && m->e[i].klen == n && !memcmp(m->e[i].key, k, n)) { m->e[i].val = v; return; }
+    map_put(m, k, n, h, v);
+}
+static void pso_record(const PsoKey *k) {
+    if (!pso_file) {
+        char path[1100]; snprintf(path, sizeof path, "%s/pipelines_v2.bin", rt_data_dir);
+        if (!(pso_file = fopen(path, "ab"))) return;
+    }
+    PsoRecord r; memset(&r, 0, sizeof r); r.k = *k; r.k.layout = 0;
+    r.n = layouts[k->layout].n; memcpy(r.e, layouts[k->layout].e, sizeof *r.e * (size_t)r.n);
+    fwrite(&r, sizeof r, 1, pso_file); fflush(pso_file);
+}
+// compile k in the background (no-op when it exists or is already being built); 1 when a compile was started
+static int async_started, async_done; static double async_t0;
+static int fg_inflight;   // (pso_mu) look-ahead builds running: the background queue waits for them
+// Background builds run on one low-priority queue, a few at a time: the loading thread only queues them (building a
+// descriptor can itself compile: the pixel function without alpha test), and the compiler's queue stays short, so a
+// pipeline a draw needs right now isn't stuck behind thousands of speculative ones (a queued one it builds itself).
+static dispatch_queue_t pso_queue; static dispatch_semaphore_t pso_slots;
+static void pso_finish(const PsoKey *k, uint64_t h, id<MTLRenderPipelineState> p) {
+    pthread_mutex_lock(&pso_mu);
+    if (p && !map_get(&pso_map, k, sizeof *k, h)) map_put(&pso_map, k, sizeof *k, h, (__bridge_retained void *)p);
+    map_set(&pso_state, k, sizeof *k, h, (void *)2);
+    if (++async_done % 2000 == 0) rt_log("[mtl] background pipelines: %d of %d done, %.0f ms into the batch", async_done, async_started, now_ms() - async_t0);
+    if (async_done == async_started) rt_log("[mtl] background pipelines done: %d so far, last batch %.0f ms", async_done, now_ms() - async_t0);
+    pthread_cond_broadcast(&pso_cv);
+    pthread_mutex_unlock(&pso_mu);
+}
+static int pso_async(const PsoKey *k) {
+    uint64_t h = fnv(k, sizeof *k);
+    pthread_mutex_lock(&pso_mu);
+    int seen = map_get(&pso_map, k, sizeof *k, h) || map_get(&pso_state, k, sizeof *k, h);
+    if (!seen) {
+        map_set(&pso_state, k, sizeof *k, h, (void *)1);
+        if (async_started == async_done) async_t0 = now_ms();
+        async_started++;
+    }
+    pthread_mutex_unlock(&pso_mu);
+    if (seen) return 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pso_queue = dispatch_queue_create("mtl.pipelines", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_BACKGROUND, 0));
+        pso_slots = dispatch_semaphore_create(2);   // light: leaves the compiler (and the CPU) to the game and look-ahead
+    });
+    PsoKey kc = *k;
+    dispatch_async(pso_queue, ^{
+        pthread_mutex_lock(&pso_mu);
+        int have = map_get(&pso_map, &kc, sizeof kc, h) != NULL;   // a draw built it meanwhile
+        pthread_mutex_unlock(&pso_mu);
+        MTLRenderPipelineDescriptor *d = have ? nil : pso_desc(&kc);
+        if (!d) { pso_finish(&kc, h, nil); return; }
+        dispatch_semaphore_wait(pso_slots, DISPATCH_TIME_FOREVER);
+        for (;;) {   // give the compiler to look-ahead builds (pipelines a frame needs now) first
+            pthread_mutex_lock(&pso_mu); int busy = fg_inflight; pthread_mutex_unlock(&pso_mu);
+            if (!busy) break;
+            usleep(1000);
+        }
+        pthread_mutex_lock(&pso_mu);
+        have = map_get(&pso_map, &kc, sizeof kc, h) != NULL;
+        if (!have) map_set(&pso_state, &kc, sizeof kc, h, (void *)3);   // compiling: a draw needing it waits for it
+        pthread_mutex_unlock(&pso_mu);
+        if (have) { pso_finish(&kc, h, nil); dispatch_semaphore_signal(pso_slots); return; }
+        [dev newRenderPipelineStateWithDescriptor:d completionHandler:^(id<MTLRenderPipelineState> p, NSError *e) {
+            (void)e;
+            pso_finish(&kc, h, p);
+            dispatch_semaphore_signal(pso_slots);
+        }];
+    });
+    return 1;
+}
+void mtlr_prewarm(void) {
+    if (!active) return;
+    char path[1100]; snprintf(path, sizeof path, "%s/pipelines_v2.bin", rt_data_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    PsoRecord r; int n = 0, skipped = 0;
+    while (fread(&r, sizeof r, 1, f) == 1) {
+        if (r.n < 0 || r.n > 32 || !mtlr_shader_info(r.k.vs) || !mtlr_shader_info(r.k.ps)) { skipped++; continue; }
+        PsoKey k = r.k; k.layout = r.n ? mtlr_vertex_layout(r.e, r.n) : 0;
+        n += pso_async(&k);
+    }
+    fclose(f);
+    rt_log("[mtl] building %d recorded pipelines in the background (%d skipped)", n, skipped);
+}
+
+// Speculation: the target/blend setups of the pipelines built so far, by use. A shader pair the game loads is built
+// against the most used ones in the background (mtlr_speculate), long before its first draw.
+typedef struct { uint32_t color[4], depth; uint8_t samples, srgb_mask, alpha_test, pad; MtlBlend blend[4]; } FragCfg;
+#define NCFG 64
+static struct { FragCfg c; uint32_t n; } cfgs[NCFG]; static int ncfg;   // pso_mu
+static int cfg_same(const FragCfg *a, const FragCfg *b) {   // the depth format doesn't change the shader binaries
+    FragCfg x = *a, y = *b; x.depth = y.depth = 0; return !memcmp(&x, &y, sizeof x);
+}
+static void cfg_count(const FragCfg *c, uint32_t w) {
+    for (int i = 0; i < ncfg; i++) if (cfg_same(&cfgs[i].c, c)) { cfgs[i].n += w; return; }
+    if (ncfg < NCFG) { cfgs[ncfg].c = *c; cfgs[ncfg].n = w; ncfg++; }
+}
+static void cfg_of(const PsoKey *k, FragCfg *c) {
+    memset(c, 0, sizeof *c);
+    memcpy(c->color, k->color, sizeof c->color); c->depth = k->depth; c->samples = k->samples; c->srgb_mask = k->srgb_mask;
+    c->alpha_test = k->alpha_test; memcpy(c->blend, k->blend, sizeof c->blend);
+}
+void mtlr_speculate_config(const uint32_t color[4], uint32_t depth, int alpha_test, const MtlBlend blend[4], uint32_t weight) {
+    FragCfg c; memset(&c, 0, sizeof c);
+    memcpy(c.color, color, sizeof c.color); c.depth = depth; c.samples = 1; c.alpha_test = (uint8_t)alpha_test;
+    for (int i = 0; i < 4; i++) if (color[i]) c.blend[i] = blend[i];
+    pthread_mutex_lock(&pso_mu); cfg_count(&c, weight); pthread_mutex_unlock(&pso_mu);
+}
+static int spec_n;
+static Map spec_pairs;   // debug (RT_RN_LEAD): shader pairs speculated
+void mtlr_speculate(uint32_t vs, uint32_t ps, uint32_t layout, int rank) {
+    if (!active || !mtlr_shader_info(vs) || !mtlr_shader_info(ps) || layout >= (uint32_t)nlayouts) return;
+    { uint32_t pr[2] = {vs, ps}; pthread_mutex_lock(&pso_mu); map_set(&spec_pairs, pr, 8, fnv(pr, 8), (void *)(uintptr_t)(layout + 1)); pthread_mutex_unlock(&pso_mu); }
+    FragCfg best[8]; int nb = 0;
+    pthread_mutex_lock(&pso_mu);
+    {   // the setup of that rank by use (0: the most used)
+        uint8_t used[NCFG] = {0};
+        int top = rank + 1;
+        if (top > NCFG) top = NCFG;
+        for (; nb < top; nb++) {
+            int bi = -1;
+            for (int i = 0; i < ncfg; i++) if (!used[i] && (bi < 0 || cfgs[i].n > cfgs[bi].n)) bi = i;
+            if (bi < 0) break;
+            used[bi] = 1; best[nb] = cfgs[bi].c;
+        }
+    }
+    pthread_mutex_unlock(&pso_mu);
+    for (int i = rank; i < nb; i++) {
+        PsoKey k; memset(&k, 0, sizeof k);
+        k.vs = vs; k.ps = ps; k.layout = layout;
+        memcpy(k.color, best[i].color, sizeof k.color); k.depth = best[i].depth; k.samples = best[i].samples;
+        k.srgb_mask = best[i].srgb_mask; k.alpha_test = best[i].alpha_test; memcpy(k.blend, best[i].blend, sizeof k.blend);
+        for (int j = 0; j < layouts[layout].n; j++) k.strides[layouts[layout].e[j].stream] = 1;
+        spec_n += pso_async(&k);
+    }
+}
+int mtlr_speculated(void) { return spec_n; }
+
+// Look-ahead: before a frame's packets are replayed for real, a dry pass (mtlr_lookahead_begin/end) computes every
+// draw's pipeline key and starts the missing ones at once, in parallel, at high priority; the real pass then waits
+// for them together. A room's first frame needing 20+ new pipelines costs one parallel round instead of a serial sum.
+static int dry, dry_n;
+static __typeof__(st) dry_saved;
+static void pso_prefetch(const PsoKey *k) {
+    uint64_t h = fnv(k, sizeof *k);
+    pthread_mutex_lock(&pso_mu);
+    void *state = map_get(&pso_state, k, sizeof *k, h);
+    int skip = map_get(&pso_map, k, sizeof *k, h) || state == (void *)3;
+    if (!skip) {
+        map_set(&pso_state, k, sizeof *k, h, (void *)3);
+        if (!state) { if (async_started == async_done) async_t0 = now_ms(); async_started++; }   // queued ones are counted
+        fg_inflight++;
+    }
+    pthread_mutex_unlock(&pso_mu);
+    if (skip) return;
+    dry_n++;
+    if (!state) pso_record(k);
+    PsoKey kc = *k;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        MTLRenderPipelineDescriptor *d = pso_desc(&kc);
+        void (^done)(id<MTLRenderPipelineState>) = ^(id<MTLRenderPipelineState> p) {
+            pthread_mutex_lock(&pso_mu); fg_inflight--; pthread_mutex_unlock(&pso_mu);
+            pso_finish(&kc, h, p);
+        };
+        if (!d) { done(nil); return; }
+        [dev newRenderPipelineStateWithDescriptor:d completionHandler:^(id<MTLRenderPipelineState> p, NSError *e) { (void)e; done(p); }];
+    });
+}
+void mtlr_lookahead_begin(void) { dry_saved = st; dry = 1; dry_n = 0; }
+int mtlr_lookahead_end(void) { st = dry_saved; dry = 0; return dry_n; }
+
+static id<MTLRenderPipelineState> pipeline(const PsoKey *k) {
+    uint64_t h = fnv(k, sizeof *k);
+    pthread_mutex_lock(&pso_mu);
+    id<MTLRenderPipelineState> p = (__bridge id<MTLRenderPipelineState>)map_get(&pso_map, k, sizeof *k, h);
+    void *state = p ? NULL : map_get(&pso_state, k, sizeof *k, h);
+    double t0 = now_ms();
+    if (!p) { FragCfg c; cfg_of(k, &c); cfg_count(&c, 1); }
+    // being built in the background: wait for it, but not behind a long queue (then build it here as well)
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 1;   // a whole look-ahead batch can be compiling at once
+    while (!p && state == (void *)3) {   // only when compiling; merely queued: build it here now
+        if (pthread_cond_timedwait(&pso_cv, &pso_mu, &dl)) break;
+        p = (__bridge id<MTLRenderPipelineState>)map_get(&pso_map, k, sizeof *k, h);
+        state = map_get(&pso_state, k, sizeof *k, h);
+    }
+    pthread_mutex_unlock(&pso_mu);
+    if (p) { if (state) { double w = now_ms() - t0; if (w > 0.05) { fs_pso_ms += w; fs_pso_n++; } } return p; }
+    MTLRenderPipelineDescriptor *d = pso_desc(k);
+    if (!d) return nil;
     NSError *err = nil;
     p = [dev newRenderPipelineStateWithDescriptor:d error:&err];
-    if (!p) { rt_log("[mtl] pipeline %s/%s: %s", vs->function, ps->function, err.localizedDescription.UTF8String); return nil; }
-    map_put(&pso_map, k, sizeof *k, h, (__bridge_retained void *)p);
+    if (!p) { rt_log("[mtl] pipeline %08x/%08x: %s", k->vs, k->ps, err.localizedDescription.UTF8String); return nil; }
+    pthread_mutex_lock(&pso_mu);
+    id<MTLRenderPipelineState> q = (__bridge id<MTLRenderPipelineState>)map_get(&pso_map, k, sizeof *k, h);
+    if (q) p = q; else map_put(&pso_map, k, sizeof *k, h, (__bridge_retained void *)p);
+    pthread_mutex_unlock(&pso_mu);
+    if (!state) pso_record(k);
+    fs_pso_ms += now_ms() - t0; fs_pso_n++;
+    if (getenv("RT_RN_LEAD")) {
+        uint32_t pr[2] = {k->vs, k->ps};
+        pthread_mutex_lock(&pso_mu); uintptr_t sl = (uintptr_t)map_get(&spec_pairs, pr, 8, fnv(pr, 8)); pthread_mutex_unlock(&pso_mu);
+        char st_[96] = ""; for (int s = 0; s < 16; s++) if (k->strides[s]) { size_t l = strlen(st_); snprintf(st_ + l, sizeof st_ - l, "%d%s ", s, k->rates[s] ? "i" : ""); }
+        rt_log("[mtl] new pipeline %08x/%08x %.1f ms%s: pair %s (layout %u, spec layout %d) color %u,%u depth %u alpha %u srgb %u blend %u,%u,%u,%u,%u,%u,%u,%u streams %s",
+               k->vs, k->ps, now_ms() - t0, state ? " (was being built)" : "", sl ? "speculated" : "not loaded", k->layout, (int)sl - 1,
+               k->color[0], k->color[1], k->depth, k->alpha_test, k->srgb_mask, k->blend[0].enable, k->blend[0].src, k->blend[0].dst, k->blend[0].op,
+               k->blend[0].src_a, k->blend[0].dst_a, k->blend[0].op_a, k->blend[0].mask, st_);
+    }
     return p;
 }
 static id<MTLDepthStencilState> depth_state(const MtlDepthStencil *s, int has_depth, int has_stencil) {
@@ -689,6 +1036,216 @@ static id<MTLTexture> target_view(const MtlTarget *t, Tex *x) {
     }
     return x->tex;
 }
+
+// ---------------- deferred clears ----------------
+// A clear is recorded and applied when its texture is next a render target: as that pass's clear load action (a
+// full clear) or as a quad at the start of the pass (a viewport-sized one). On a tile GPU a pass loads and stores its
+// whole attachments, so a pass of its own for a clear costs a full read and write of the target (a partial clear of
+// a large shadow atlas: milliseconds); deferred, it costs nothing extra, and a depth clear whose result no pass ever
+// attaches costs nothing at all. Before a texture is read (sampled, copied, presented, read back, uploaded to), its
+// clears are applied in a small pass of their own (pend_flush).
+typedef struct {
+    MtlTex tex; int level, face, depth;   // depth: the depth/stencil texture (flags DEPTH and/or STENCIL)
+    int flags, full;
+    float color[4], z; uint8_t stencil;
+    MTLViewport vp;                       // the cleared area (viewport, without the half-pixel offset)
+} Pend;
+#define NPEND 32
+static Pend pend[NPEND]; static int npend;
+static void pend_remove(int i) { memmove(&pend[i], &pend[i + 1], sizeof *pend * (size_t)(npend - i - 1)); npend--; }
+static int pend_match(const Pend *q, MtlTex t, int level, int face, int depth) { return q->tex == t && q->level == level && q->face == face && q->depth == depth; }
+static int pend_add(const Pend *n) {
+    if (n->full) for (int i = npend - 1; i >= 0; i--)   // a full clear supersedes earlier ones it covers
+        if (pend_match(&pend[i], n->tex, n->level, n->face, n->depth) && (pend[i].flags & ~n->flags) == 0) pend_remove(i);
+    if (npend >= NPEND) return 0;
+    pend[npend++] = *n;
+    if (pass_log) { Tex *x = tget(n->tex); rt_log("[pass] pending clear tex %u %ux%u %s flags %d full %d rect %.0f,%.0f %.0fx%.0f value %g/%g", n->tex, x ? (unsigned)x->d.width : 0, x ? (unsigned)x->d.height : 0, n->depth ? "depth" : "color", n->flags, n->full, n->vp.originX, n->vp.originY, n->vp.width, n->vp.height, n->depth ? n->z : n->color[0], n->color[3]); }
+    return 1;
+}
+// a clear quad inside the open encoder: writes only the attachments in cmask (color) / depth / stencil
+static id<MTLRenderPipelineState> clear_quad_pso(const uint32_t cfmt[4], uint32_t dfmt, int samples, uint8_t cmask) {
+    static Map m;
+    uint32_t key[7] = {cfmt[0], cfmt[1], cfmt[2], cfmt[3], dfmt, (uint32_t)samples, cmask};
+    uint64_t h = fnv(key, sizeof key);
+    id<MTLRenderPipelineState> p = (__bridge id<MTLRenderPipelineState>)map_get(&m, key, sizeof key, h);
+    if (p) return p;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [builtin newFunctionWithName:@"clear_vs"]; d.fragmentFunction = [builtin newFunctionWithName:@"clear_ps"];
+    for (int i = 0; i < 4; i++) { d.colorAttachments[i].pixelFormat = (MTLPixelFormat)cfmt[i]; d.colorAttachments[i].writeMask = (cmask >> i) & 1 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone; }
+    d.depthAttachmentPixelFormat = (MTLPixelFormat)dfmt;
+    if (dfmt == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = (MTLPixelFormat)dfmt;
+    d.rasterSampleCount = samples ? samples : 1;
+    p = [dev newRenderPipelineStateWithDescriptor:d error:nil];
+    map_put(&m, key, sizeof key, h, (__bridge_retained void *)p);
+    return p;
+}
+static void clear_quad(id<MTLRenderCommandEncoder> e, const uint32_t cfmt[4], uint32_t dfmt, int samples, uint8_t cmask, const Pend *q, uint32_t w, uint32_t h) {
+    [e setRenderPipelineState:clear_quad_pso(cfmt, dfmt, samples, cmask)];
+    MtlDepthStencil ds = {0};
+    ds.depth_test = q->depth && (q->flags & MTLR_CLEAR_DEPTH); ds.depth_write = ds.depth_test; ds.depth_func = MTLCompareFunctionAlways;
+    if (q->depth && (q->flags & MTLR_CLEAR_STENCIL)) { ds.stencil = 1; ds.front = ds.back = (MtlStencilFace){MTLStencilOperationReplace, MTLStencilOperationReplace, MTLStencilOperationReplace, MTLCompareFunctionAlways}; ds.read_mask = ds.write_mask = 0xFF; }
+    [e setDepthStencilState:depth_state(&ds, dfmt != 0, dfmt == MTLPixelFormatDepth32Float_Stencil8)];
+    [e setStencilReferenceValue:q->stencil];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:q->vp];
+    [e setScissorRect:(MTLScissorRect){0, 0, w, h}];
+    float z = q->z;
+    [e setVertexBytes:&z length:4 atIndex:0];
+    [e setFragmentBytes:q->color length:16 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+static void end_encoder(void);
+static void ensure_cmd(void);
+// apply a texture's pending clears now, in a pass of their own (before it is read)
+static void pend_flush(MtlTex t) {
+    if (!npend || !t) return;
+    int any = 0; for (int i = 0; i < npend; i++) if (pend[i].tex == t) any = 1;
+    if (!any) return;
+    Tex *x = tget(t);
+    if (!x || !x->tex) { for (int i = npend - 1; i >= 0; i--) if (pend[i].tex == t) pend_remove(i); return; }
+    ensure_cmd(); end_encoder();
+    for (int i = 0; i < npend; ) {   // one pass per (level, face) of t
+        if (pend[i].tex != t) { i++; continue; }
+        int level = pend[i].level, face = pend[i].face, depth = pend[i].depth;
+        MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+        uint32_t cfmt[4] = {0}, dfmt = 0;
+        if (depth) {
+            p.depthAttachment.texture = x->tex; p.depthAttachment.level = level; p.depthAttachment.slice = face;
+            p.depthAttachment.loadAction = MTLLoadActionLoad; p.depthAttachment.storeAction = MTLStoreActionStore;
+            if (x->tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                p.stencilAttachment.texture = x->tex; p.stencilAttachment.level = level; p.stencilAttachment.slice = face;
+                p.stencilAttachment.loadAction = MTLLoadActionLoad; p.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+            dfmt = (uint32_t)x->tex.pixelFormat;
+        } else {
+            p.colorAttachments[0].texture = x->tex; p.colorAttachments[0].level = level; p.colorAttachments[0].slice = face;
+            p.colorAttachments[0].loadAction = MTLLoadActionLoad; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+            cfmt[0] = (uint32_t)x->tex.pixelFormat;
+        }
+        id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:p];
+        uint32_t w = MAX(1u, (uint32_t)x->tex.width >> level), h = MAX(1u, (uint32_t)x->tex.height >> level);
+        for (int j = i; j < npend; ) {
+            if (pend_match(&pend[j], t, level, face, depth)) { clear_quad(e, cfmt, dfmt, x->d.samples, depth ? 0 : 1, &pend[j], w, h); pend_remove(j); }
+            else j++;
+        }
+        [e endEncoding];
+    }
+    st.targets_dirty = 1;
+}
+static void pend_drop(MtlTex h) { for (int i = npend - 1; i >= 0; i--) if (pend[i].tex == h) pend_remove(i); }
+static void pend_flush_mtl(id<MTLTexture> t) {   // by Metal texture (uploads)
+    for (int i = 0; i < npend; i++) { Tex *x = tget(pend[i].tex); if (x && x->tex == t) { pend_flush(pend[i].tex); i = -1; } }
+}
+static int npend_any(void) { return npend; }
+static void pend_flush_uploads(void) {
+    pthread_mutex_lock(&up_mu);
+    int n = nups; id<MTLTexture> ts[64]; int k = 0;
+    for (int i = 0; i < n && k < 64; i++) ts[k++] = ups[i].tex;
+    pthread_mutex_unlock(&up_mu);
+    for (int i = 0; i < k; i++) pend_flush_mtl(ts[i]);
+}
+// ---------------- scratch depth ----------------
+// A depth buffer that is only ever tested inside regions cleared in the same pass (a shadow atlas: each tile cleared,
+// then its casters drawn) and never read as a texture doesn't need its old contents, nor to be written back: after 30
+// frames seen to qualify it is neither loaded nor stored (hundreds of MB a frame for a large atlas). One draw
+// outside the cleared regions, or any read of the texture, puts it back to normal for good.
+typedef struct { MtlTex t; uint8_t bad, read; uint32_t clean, last; } ScratchD;
+static ScratchD scr[64]; static int nscr;
+static ScratchD *scr_get(MtlTex t, int make) {
+    for (int i = 0; i < nscr; i++) if (scr[i].t == t) return &scr[i];
+    if (!make || nscr >= 64) return NULL;
+    scr[nscr] = (ScratchD){t, 0, 0, 0, 0xFFFFFFFFu};
+    return &scr[nscr++];
+}
+static void scr_read(MtlTex t) { ScratchD *d = t ? scr_get(t, 0) : NULL; if (d && !d->read) { d->read = 1; rt_log("[mtl] depth %u is read (sampled/copied): not scratch", t); } }
+static int pass_dtrack, pass_dfull, pass_dn, pass_dclean, pass_dused, pass_dscratch; static MtlTex pass_dtex;
+static float pass_drect[16][4];   // x0 y0 x1 y1 of the depth regions cleared in this pass
+static void pass_dclear_rect(const MTLViewport *v) {
+    if (pass_dn < 16) { float *r = pass_drect[pass_dn++]; r[0] = (float)v->originX; r[1] = (float)v->originY; r[2] = (float)(v->originX + v->width); r[3] = (float)(v->originY + v->height); }
+    else pass_dclean = 0;
+}
+static void pass_ddraw(float x0, float y0, float x1, float y1) {   // a depth-using draw over this area
+    pass_dused = 1;
+    if (pass_dfull) return;
+    for (int i = 0; i < pass_dn; i++) {
+        float *r = pass_drect[i];
+        if (x0 >= r[0] - 1 && y0 >= r[1] - 1 && x1 <= r[2] + 1 && y1 <= r[3] + 1) return;
+    }
+    if (pass_dclean) { static int n; if (n++ < 6) { rt_log("[mtl] depth %u: draw %.0f,%.0f-%.0f,%.0f outside %d cleared regions%s", pass_dtex, x0, y0, x1, y1, pass_dn, pass_dn ? ":" : "");
+        for (int i = 0; i < pass_dn && i < 6; i++) rt_log("[mtl]   cleared %.0f,%.0f-%.0f,%.0f", pass_drect[i][0], pass_drect[i][1], pass_drect[i][2], pass_drect[i][3]); } }
+    pass_dclean = 0;
+}
+static void pass_dend(void) {
+    if (!pass_dtrack || !pass_dused) { pass_dtrack = 0; return; }
+    ScratchD *d = scr_get(pass_dtex, 1);
+    if (d) {
+        if (!pass_dclean) {
+            if (!d->bad && pass_dscratch) rt_log("[mtl] depth %u was used outside its cleared regions: loaded and stored again", pass_dtex);
+            d->bad = 1;
+        } else if (d->last != frame_no) {
+            d->last = frame_no;
+            if (++d->clean == 30 && !d->bad && !d->read) { Tex *x = tget(pass_dtex); rt_log("[mtl] depth %u (%ux%u) is scratch: not loaded or stored", pass_dtex, x ? (unsigned)x->d.width : 0, x ? (unsigned)x->d.height : 0); }
+        }
+    }
+    pass_dtrack = 0;
+}
+static int scr_ok(MtlTex t) {
+    static int off = -1; if (off < 0) off = getenv("RT_METAL_NO_SCRATCH_DEPTH") != NULL;
+    ScratchD *d = scr_get(t, 0);
+    return !off && d && !d->bad && !d->read && d->clean >= 30;
+}
+
+// ---------------- full-screen first draws ----------------
+// A pass whose first draw replaces every pixel of its color target (a post-effect quad: at most 6 vertices spanning
+// clip space, full viewport and scissor, no blending, all channels written, no alpha test or depth) doesn't need the
+// target's old contents: it isn't loaded (on a tile GPU, a full read of the target saved). RT_METAL_NO_FULLSCREEN_SKIP=1
+// turns it off; RT_METAL_SKIP_CHECK=1 clears such targets to magenta instead, so a wrong guess shows on screen.
+static uint32_t draw_first, draw_count; static int draw_indexed, pass_first_full;
+static int full_cover(uint32_t w, uint32_t h) {
+    static int off = -1; if (off < 0) off = getenv("RT_METAL_NO_FULLSCREEN_SKIP") != NULL;
+    if (off || draw_indexed || draw_count < 3 || draw_count > 6 || st.alpha_func != 7) {
+        if (getenv("RT_METAL_SKIP_DEBUG") && !draw_indexed && draw_count <= 6) { static int n; if (n++ < 6) rt_log("[skip] rejected: count %u alpha %d", draw_count, st.alpha_func); }
+        return 0;
+    }
+    if (st.vp.originX - 0.5 > 0 || st.vp.originY - 0.5 > 0 || st.vp.width < w || st.vp.height < h) return 0;
+    if (st.sc.x > 0 || st.sc.y > 0 || st.sc.x + st.sc.width < w || st.sc.y + st.sc.height < h) return 0;
+    const MtlVertexElement *pe = NULL;
+    for (int j = 0; j < layouts[st.layout].n; j++) { const MtlVertexElement *e = &layouts[st.layout].e[j]; if ((e->usage == 0 || e->usage == 9) && e->index == 0) { pe = e; break; } }
+    if (getenv("RT_METAL_SKIP_DEBUG") && (!pe || pe->stream >= 15)) { static int n; if (n++ < 6) { char b[200] = ""; size_t o = 0; for (int j = 0; j < layouts[st.layout].n && o < 180; j++) o += (size_t)snprintf(b + o, sizeof b - o, " %u.%u f%u", layouts[st.layout].e[j].usage, layouts[st.layout].e[j].index, layouts[st.layout].e[j].format); rt_log("[skip] no position: layout%s", b); } }
+    if (!pe || pe->stream >= 15 || (pe->format != MTLVertexFormatFloat2 && pe->format != MTLVertexFormatFloat3 && pe->format != MTLVertexFormatFloat4)) return 0;
+    const Stream *sm = &st.streams[pe->stream];
+    if (!sm->addr || !sm->stride || sm->rate) return 0;
+    if (getenv("RT_METAL_SKIP_DEBUG")) { static int n; if (n++ < 12) {
+        const float *f = (const float *)G2H(sm->addr + draw_first * sm->stride + pe->offset);
+        rt_log("[skip] %ux%u vp %.1f,%.1f %.0fx%.0f fmt %u count %u v0 %g %g %g %g", w, h, st.vp.originX, st.vp.originY, st.vp.width, st.vp.height, pe->format, draw_count, f[0], f[1], pe->format >= MTLVertexFormatFloat3 ? f[2] : 0, pe->format == MTLVertexFormatFloat4 ? f[3] : 0); } }
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (uint32_t v = draw_first; v < draw_first + draw_count; v++) {
+        const float *f = (const float *)G2H(sm->addr + v * sm->stride + pe->offset);
+        if (pe->format == MTLVertexFormatFloat4 && f[3] != 0.0f && (f[3] < 0.999f || f[3] > 1.001f)) return 0;   // w 0 (the shader sets it) or 1
+        x0 = MIN(x0, f[0]); x1 = MAX(x1, f[0]); y0 = MIN(y0, f[1]); y1 = MAX(y1, f[1]);
+    }
+    return x0 <= -0.999f && x1 >= 0.999f && y0 <= -0.999f && y1 >= 0.999f;   // clip space, the whole of it
+}
+
+// depth attachment decisions: per (color target 0, depth target, the pass's first draw's shaders), whether the pass
+// needed depth last time (it is learned at the end of each pass)
+static int enc_has_depth, pass_want_depth, pass_needed_depth; static uint32_t pass_first_vs, pass_first_ps;
+static struct { uint32_t c, d, vs, ps; uint8_t used, want; } dwant[1024];
+static uint32_t dwant_slot(uint32_t vs, uint32_t ps) {
+    uint32_t k[4] = {st.color[0].tex, st.depth.tex, vs, ps};
+    return (uint32_t)fnv(k, sizeof k) & 1023;
+}
+static int depth_wanted(uint32_t vs, uint32_t ps) {
+    uint32_t i = dwant_slot(vs, ps);
+    return dwant[i].used && dwant[i].c == st.color[0].tex && dwant[i].d == st.depth.tex && dwant[i].vs == vs && dwant[i].ps == ps && dwant[i].want;
+}
+static void depth_learn(void) {   // at the end of a pass (st still holds its targets unless they changed: use enc_*)
+    if (!enc_depth.tex) return;
+    uint32_t k[4] = {enc_color[0].tex, enc_depth.tex, pass_first_vs, pass_first_ps};
+    uint32_t i = (uint32_t)fnv(k, sizeof k) & 1023;
+    dwant[i].used = 1; dwant[i].c = enc_color[0].tex; dwant[i].d = enc_depth.tex; dwant[i].vs = pass_first_vs; dwant[i].ps = pass_first_ps;
+    dwant[i].want = (uint8_t)pass_needed_depth;
+}
 // begin a render pass on the current targets; clear = load actions for a full-target clear
 static void begin_pass(int clear, const float color[4], float depth, uint8_t stencil) {
     ensure_cmd();
@@ -703,30 +1260,128 @@ static void begin_pass(int clear, const float color[4], float depth, uint8_t ste
         p.colorAttachments[i].loadAction = (clear & MTLR_CLEAR_COLOR) ? MTLLoadActionClear : MTLLoadActionLoad;
         if (clear & MTLR_CLEAR_COLOR) p.colorAttachments[i].clearColor = MTLClearColorMake(color[0], color[1], color[2], color[3]);
         p.colorAttachments[i].storeAction = MTLStoreActionStore;
+        if (pass_first_full && !(clear & MTLR_CLEAR_COLOR) && !st.blend[i].enable && st.blend[i].mask == 15) {
+            static int check = -1; if (check < 0) check = getenv("RT_METAL_SKIP_CHECK") != NULL;
+            for (int j = npend - 1; j >= 0; j--) if (pend_match(&pend[j], st.color[i].tex, st.color[i].level, st.color[i].face, 0)) pend_remove(j);   // overwritten too
+            if (check) { p.colorAttachments[i].loadAction = MTLLoadActionClear; p.colorAttachments[i].clearColor = MTLClearColorMake(1, 0, 1, 1); }
+            else p.colorAttachments[i].loadAction = MTLLoadActionDontCare;
+            dbg[7]++;
+            continue;
+        }
+        for (int j = 0; j < npend; ) {   // pending clears of this attachment: superseded, or its load action (full)
+            Pend *q = &pend[j];
+            if (!pend_match(q, st.color[i].tex, st.color[i].level, st.color[i].face, 0)) { j++; continue; }
+            if (clear & MTLR_CLEAR_COLOR) { pend_remove(j); continue; }
+            if (q->full && p.colorAttachments[i].loadAction == MTLLoadActionLoad) {
+                p.colorAttachments[i].loadAction = MTLLoadActionClear;
+                p.colorAttachments[i].clearColor = MTLClearColorMake(q->color[0], q->color[1], q->color[2], q->color[3]);
+                pend_remove(j); continue;
+            }
+            break;   // a partial one: drawn as a quad once the pass is open (with any after it)
+        }
     }
     Tex *dx = tget(st.depth.tex);
+    // depth only when the pass uses it (a full-screen pass that never tests or writes it would load and store the
+    // whole depth buffer for nothing): it clears it, its first draw needs it, or it did last time (depth_wanted)
+    int have_color = p.colorAttachments[0].texture || p.colorAttachments[1].texture;
+    if (dx && have_color && !(clear & (MTLR_CLEAR_DEPTH | MTLR_CLEAR_STENCIL)) && !pass_want_depth) dx = NULL;
+    enc_has_depth = dx != NULL;
+    pass_needed_depth = (clear & (MTLR_CLEAR_DEPTH | MTLR_CLEAR_STENCIL)) != 0;
     if (dx) {
         p.depthAttachment.texture = dx->tex; p.depthAttachment.level = st.depth.level;
         p.depthAttachment.loadAction = (clear & MTLR_CLEAR_DEPTH) ? MTLLoadActionClear : MTLLoadActionLoad;
         p.depthAttachment.clearDepth = depth; p.depthAttachment.storeAction = MTLStoreActionStore;
-        if (dx->tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+        int has_st = dx->tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+        if (has_st) {
             p.stencilAttachment.texture = dx->tex; p.stencilAttachment.level = st.depth.level;
             p.stencilAttachment.loadAction = (clear & MTLR_CLEAR_STENCIL) ? MTLLoadActionClear : MTLLoadActionLoad;
             p.stencilAttachment.clearStencil = stencil; p.stencilAttachment.storeAction = MTLStoreActionStore;
         }
+        pass_dtrack = 1; pass_dtex = st.depth.tex; pass_dn = 0; pass_dclean = 1; pass_dused = 0;
+        pass_dfull = (clear & MTLR_CLEAR_DEPTH) != 0;
+        for (int j = 0; j < npend; ) {   // pending depth/stencil clears, as for color
+            Pend *q = &pend[j];
+            if (!pend_match(q, st.depth.tex, st.depth.level, st.depth.face, 1)) { j++; continue; }
+            int need = (q->flags & MTLR_CLEAR_DEPTH ? MTLR_CLEAR_DEPTH : 0) | (has_st && (q->flags & MTLR_CLEAR_STENCIL) ? MTLR_CLEAR_STENCIL : 0);
+            if ((clear & need) == need) { pend_remove(j); continue; }
+            if (q->full && !(clear & (MTLR_CLEAR_DEPTH | MTLR_CLEAR_STENCIL)) && p.depthAttachment.loadAction == MTLLoadActionLoad) {
+                if (q->flags & MTLR_CLEAR_DEPTH) { p.depthAttachment.loadAction = MTLLoadActionClear; p.depthAttachment.clearDepth = q->z; pass_dfull = 1; }
+                if (has_st && (q->flags & MTLR_CLEAR_STENCIL)) { p.stencilAttachment.loadAction = MTLLoadActionClear; p.stencilAttachment.clearStencil = q->stencil; }
+                pend_remove(j); continue;
+            }
+            break;
+        }
+        // partial pending depth clears become quads at the start of this pass: regions the draws may use
+        for (int j = 0; j < npend; j++) if (pend_match(&pend[j], st.depth.tex, st.depth.level, st.depth.face, 1) && (pend[j].flags & MTLR_CLEAR_DEPTH)) pass_dclear_rect(&pend[j].vp);
+        pass_dscratch = scr_ok(st.depth.tex);
+        if (pass_dscratch) {   // old contents never needed, new ones never read: keep it on chip
+            if (p.depthAttachment.loadAction == MTLLoadActionLoad) p.depthAttachment.loadAction = MTLLoadActionDontCare;
+            p.depthAttachment.storeAction = MTLStoreActionDontCare;
+            if (p.stencilAttachment.texture) {
+                if (p.stencilAttachment.loadAction == MTLLoadActionLoad) p.stencilAttachment.loadAction = MTLLoadActionDontCare;
+                p.stencilAttachment.storeAction = MTLStoreActionDontCare;
+            }
+        }
     }
     if (!p.colorAttachments[0].texture && !dx) return;
+    if (pass_log) {
+        if (!pass_cs) {
+            id<MTLCounterSet> ts = nil;
+            for (id<MTLCounterSet> cs in dev.counterSets) if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+            if (ts && [dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                MTLCounterSampleBufferDescriptor *cd = [MTLCounterSampleBufferDescriptor new];
+                cd.counterSet = ts; cd.storageMode = MTLStorageModeShared; cd.sampleCount = 64 * 4;
+                pass_cs = [dev newCounterSampleBufferWithDescriptor:cd error:nil];
+            }
+        }
+        if (pass_cs && pass_n < 64) {
+            MTLRenderPassSampleBufferAttachmentDescriptor *a = p.sampleBufferAttachments[0];
+            a.sampleBuffer = pass_cs;
+            a.startOfVertexSampleIndex = 4 * pass_n; a.endOfVertexSampleIndex = 4 * pass_n + 1;
+            a.startOfFragmentSampleIndex = 4 * pass_n + 2; a.endOfFragmentSampleIndex = 4 * pass_n + 3;
+        }
+        pass_n++;
+    }
     enc = [cmd renderCommandEncoderWithDescriptor:p]; dbg[3]++;
+    if (npend) {   // the remaining (partial) pending clears of this pass's attachments, in order, as quads
+        uint32_t cfmt[4] = {0}, w = 1, h = 1;
+        for (int i = 0; i < 4; i++) if (p.colorAttachments[i].texture) cfmt[i] = (uint32_t)p.colorAttachments[i].texture.pixelFormat;
+        uint32_t dfmt = dx ? (uint32_t)dx->tex.pixelFormat : 0;
+        target_size(&w, &h);
+        int samples = 1; { Tex *a = tget(st.color[0].tex) ? tget(st.color[0].tex) : dx; if (a) samples = a->d.samples; }
+        for (int j = 0; j < npend; ) {
+            Pend *q = &pend[j]; int hit = 0; uint8_t cm = 0;
+            for (int i = 0; i < 4; i++) if (p.colorAttachments[i].texture && pend_match(q, st.color[i].tex, st.color[i].level, st.color[i].face, 0)) { cm |= (uint8_t)(1 << i); hit = 1; }
+            if (dx && pend_match(q, st.depth.tex, st.depth.level, st.depth.face, 1)) hit = 1;
+            if (hit) { clear_quad(enc, cfmt, dfmt, samples, cm, q, w, h); pend_remove(j); }
+            else j++;
+        }
+    }
+    if (pass_log) {
+        size_t o = 0; pass_desc[0] = 0;
+        for (int i = 0; i < 4; i++) if (p.colorAttachments[i].texture) { id<MTLTexture> t = p.colorAttachments[i].texture;
+            o += (size_t)snprintf(pass_desc + o, sizeof pass_desc - o, "c%d %lux%lu f%lu %s ", i, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, p.colorAttachments[i].loadAction == MTLLoadActionClear ? "clr" : "load"); }
+        if (dx) snprintf(pass_desc + o, sizeof pass_desc - o, "d %lux%lu f%lu %s", (unsigned long)dx->tex.width, (unsigned long)dx->tex.height, (unsigned long)dx->tex.pixelFormat, p.depthAttachment.loadAction == MTLLoadActionClear ? "clr" : "load");
+        pass_draws = 0; pass_depth_used = 0; pass_clear = clear;
+    }
     memcpy(enc_color, st.color, sizeof enc_color); enc_depth = st.depth;
     st.targets_dirty = 0; st.vp_dirty = st.sc_dirty = 1;
     st.consts_dirty[0] = st.consts_dirty[1] = 1;
 }
-static void ensure_pass(void) {
-    if (!enc || st.targets_dirty) {
-        if (enc && !memcmp(enc_color, st.color, sizeof enc_color) && !memcmp(&enc_depth, &st.depth, sizeof enc_depth)) { st.targets_dirty = 0; return; }
+static void ensure_pass_for(int need_depth, uint32_t vs, uint32_t ps) {
+    int depth_ok = !need_depth || enc_has_depth || !tget(st.depth.tex);
+    if (!enc || st.targets_dirty || !depth_ok) {
+        if (enc && depth_ok && !memcmp(enc_color, st.color, sizeof enc_color) && !memcmp(&enc_depth, &st.depth, sizeof enc_depth)) { st.targets_dirty = 0; return; }
+        // a new pass (or the same targets again, now with depth: a draw needs it after all; then the pass being ended
+        // is remembered as needing depth, so next time it starts with it and isn't split)
+        if (enc && !depth_ok) pass_needed_depth = 1;
+        pass_want_depth = need_depth || depth_wanted(vs, ps);
+        pass_first_vs = vs; pass_first_ps = ps;
         begin_pass(0, NULL, 0, 0);
+        pass_want_depth = 0;
     }
 }
+static void ensure_pass(void) { ensure_pass_for(1, 0, 0); }
 static void apply_rect_state(void) {
     uint32_t w, h; target_size(&w, &h);
     if (st.vp_dirty) { [enc setViewport:st.vp]; st.vp_dirty = 0; }
@@ -738,8 +1393,6 @@ static void apply_rect_state(void) {
 
 static int prepare_draw(void) {
     if (!active) return 0;
-    ensure_pass();
-    if (!enc) { dbg[1]++; return 0; }
     PsoKey k; memset(&k, 0, sizeof k);
     k.vs = st.vs; k.ps = st.ps; k.layout = st.layout;
     k.alpha_test = st.alpha_func != 7;   // MTLCompareFunctionAlways: the test is off -> the variant without discard
@@ -748,11 +1401,34 @@ static int prepare_draw(void) {
         if (x) { k.color[i] = (uint32_t)target_view(&st.color[i], x).pixelFormat; k.blend[i] = st.blend[i]; k.samples = x->d.samples; }
     }
     Tex *dx = tget(st.depth.tex);
+    int need_depth = st.ds.depth_test || st.ds.depth_write || st.ds.stencil;
+    for (int j = 0; j < layouts[k.layout].n; j++) {   // only the streams the layout reads (as mtlr_speculate keys them)
+        int s = layouts[k.layout].e[j].stream;
+        if (s < 15) { k.strides[s] = st.streams[s].addr && st.streams[s].stride; k.rates[s] = (uint8_t)st.streams[s].rate; }
+    }
+    if (dry) {   // look-ahead pass: start what's missing, draw nothing (depth: as ensure_pass will likely decide)
+        if (dx && (need_depth || !k.color[0] || depth_wanted(st.vs, st.ps))) { k.depth = (uint32_t)dx->tex.pixelFormat; k.samples = dx->d.samples; }
+        pso_prefetch(&k); return 0;
+    }
+    if (npend) for (int sg = 0; sg < 2; sg++) for (int i = 0; i < 16; i++) if (st.tex[sg][i]) pend_flush(st.tex[sg][i]);   // read: clear it first
+    if (nscr) for (int sg = 0; sg < 2; sg++) for (int i = 0; i < 16; i++) if (st.tex[sg][i]) scr_read(st.tex[sg][i]);
+    { uint32_t w = 1, h = 1; target_size(&w, &h); pass_first_full = !need_depth && full_cover(w, h); }
+    ensure_pass_for(need_depth, st.vs, st.ps);
+    pass_first_full = 0;
+    if (!enc) { dbg[1]++; return 0; }
+    if (!enc_has_depth) dx = NULL;
     if (dx) { k.depth = (uint32_t)dx->tex.pixelFormat; k.samples = dx->d.samples; }
-    for (int s = 0; s < 15; s++) { k.strides[s] = st.streams[s].addr ? st.streams[s].stride : 0; k.rates[s] = (uint8_t)st.streams[s].rate; }
+    if (need_depth) pass_needed_depth = 1;
+    if (need_depth && dx && pass_dtrack) {
+        float x0 = (float)(st.vp.originX - 0.5), y0 = (float)(st.vp.originY - 0.5), x1 = x0 + (float)st.vp.width, y1 = y0 + (float)st.vp.height;
+        float sx0 = (float)st.sc.x, sy0 = (float)st.sc.y, sx1 = sx0 + (float)st.sc.width, sy1 = sy0 + (float)st.sc.height;
+        if (sx1 > sx0 && sy1 > sy0) { x0 = MAX(x0, sx0); y0 = MAX(y0, sy0); x1 = MIN(x1, sx1); y1 = MIN(y1, sy1); }
+        pass_ddraw(x0, y0, x1, y1);
+    }
     id<MTLRenderPipelineState> p = pipeline(&k);
     if (!p) { dbg[2]++; return 0; }
     dbg[0]++;
+    if (pass_log) { pass_draws++; if (st.ds.depth_test || st.ds.depth_write || st.ds.stencil) pass_depth_used = 1; }
     [enc setRenderPipelineState:p];
     [enc setDepthStencilState:depth_state(&st.ds, dx != NULL, dx && dx->tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)];
     [enc setStencilReferenceValue:st.ds.ref];
@@ -762,7 +1438,7 @@ static int prepare_draw(void) {
     [enc setTriangleFillMode:(MTLTriangleFillMode)st.rs.fill];
     [enc setDepthBias:st.rs.depth_bias slopeScale:st.rs.slope_bias clamp:0];
     apply_rect_state();
-    for (int s = 0; s < 15; s++) if (k.strides[s]) [enc setVertexBuffer:guest offset:st.streams[s].addr atIndex:s];
+    for (int s = 0; s < 15; s++) if (k.strides[s]) [enc setVertexBuffer:guest offset:st.streams[s].addr attributeStride:st.streams[s].stride atIndex:s];
     if (!zero_buf) zero_buf = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
     [enc setVertexBuffer:zero_buf offset:0 atIndex:15];
     {   // per-attribute scale for integer formats (see bound_format)
@@ -818,10 +1494,12 @@ static int prepare_draw(void) {
     return 1;
 }
 void mtlr_draw(int prim, uint32_t first, uint32_t count, uint32_t inst) {
+    draw_first = first; draw_count = count; draw_indexed = 0;
     if (!count || !prepare_draw()) return;
     [enc drawPrimitives:(MTLPrimitiveType)prim vertexStart:first vertexCount:count instanceCount:inst ? inst : 1];
 }
 void mtlr_draw_indexed(int prim, uint32_t first, uint32_t count, int32_t base, uint32_t inst) {
+    draw_indexed = 1;
     if (!count || !st.index_addr || !prepare_draw()) return;
     [enc drawIndexedPrimitives:(MTLPrimitiveType)prim indexCount:count indexType:st.index_bytes == 4 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
                    indexBuffer:guest indexBufferOffset:st.index_addr + first * (uint32_t)st.index_bytes instanceCount:inst ? inst : 1
@@ -848,15 +1526,45 @@ static id<MTLRenderPipelineState> clear_pso_for(void) {
     return p;
 }
 void mtlr_clear(int flags, const float color[4], float depth, uint8_t stencil) {
-    if (!active) return;
+    if (!active || dry) return;
     uint32_t w, h; target_size(&w, &h);
     MTLViewport v = st.vp;
     int full = v.originX - 0.5 <= 0 && v.originY - 0.5 <= 0 && v.originX - 0.5 + v.width >= w && v.originY - 0.5 + v.height >= h;
-    if (full) { dbg[4]++; begin_pass(flags, color, depth, stencil); return; }
+    int open = enc && !st.targets_dirty && !memcmp(enc_color, st.color, sizeof enc_color) && !memcmp(&enc_depth, &st.depth, sizeof enc_depth);
+    if (!open && !getenv_cached_noclear_defer()) {   // no pass on these targets: record it (deferred clears)
+        Pend q; memset(&q, 0, sizeof q);
+        q.full = full; q.z = depth; q.stencil = stencil;
+        if (color) memcpy(q.color, color, sizeof q.color);
+        q.vp = (MTLViewport){v.originX - 0.5, v.originY - 0.5, v.width, v.height, 0, 1};
+        int ok = 1;
+        if (flags & MTLR_CLEAR_COLOR) for (int i = 0; i < 4; i++) if (tget(st.color[i].tex)) {
+            q.tex = st.color[i].tex; q.level = st.color[i].level; q.face = st.color[i].face; q.depth = 0; q.flags = MTLR_CLEAR_COLOR;
+            ok &= pend_add(&q);
+        }
+        if ((flags & (MTLR_CLEAR_DEPTH | MTLR_CLEAR_STENCIL)) && tget(st.depth.tex)) {
+            q.tex = st.depth.tex; q.level = st.depth.level; q.face = st.depth.face; q.depth = 1; q.flags = flags & (MTLR_CLEAR_DEPTH | MTLR_CLEAR_STENCIL);
+            ok &= pend_add(&q);
+        }
+        if (ok) { dbg[4]++; return; }
+        // out of room: apply everything pending for these targets and fall through to an immediate clear
+        for (int i = 0; i < 4; i++) pend_flush(st.color[i].tex);
+        pend_flush(st.depth.tex);
+    }
+    if (full) {
+        dbg[4]++;
+        pass_first_vs = pass_first_ps = 0; pass_want_depth = depth_wanted(0, 0);
+        begin_pass(flags, color, depth, stencil);
+        pass_want_depth = 0;
+        return;
+    }
     dbg[5]++;
     // partial: draw a quad over the viewport with write masks for what is cleared
-    ensure_pass();
+    ensure_pass();   // with depth (the clear pipeline is made for the targets' depth format)
     if (!enc) return;
+    if ((flags & MTLR_CLEAR_DEPTH) && pass_dtrack && pass_dtex == st.depth.tex) {   // a region its later draws may use
+        MTLViewport r = {v.originX - 0.5, v.originY - 0.5, v.width, v.height, 0, 1};
+        pass_dclear_rect(&r);
+    }
     MtlBlend saved[4]; memcpy(saved, st.blend, sizeof saved);
     [enc setRenderPipelineState:clear_pso_for()];
     MtlDepthStencil ds = {0};
@@ -903,7 +1611,8 @@ static void blit_to(id<MTLTexture> dst, id<MTLTexture> src, const float r[4], in
 }
 void mtlr_copy(MtlTex s, const int sr[4], MtlTex d, const int dr[4], int linear) {
     Tex *a = tget(s), *b = tget(d);
-    if (!active || !a || !b) return;
+    if (!active || !a || !b || dry) return;
+    pend_flush(s); pend_flush(d); scr_read(s); scr_read(d);
     ensure_cmd(); end_encoder(); flush_uploads(cmd);
     int sw = sr[2] - sr[0], sh = sr[3] - sr[1], dw = dr[2] - dr[0], dh = dr[3] - dr[1];
     if (sw == dw && sh == dh && a->tex.pixelFormat == b->tex.pixelFormat && a->d.samples == b->d.samples) {
@@ -970,6 +1679,7 @@ void mtlr_debug_dump(const char *dir) {
 // read a level back to host memory (waits for the GPU): render-target readback (screenshots, save thumbnails)
 void mtlr_tex_download(MtlTex h, int face, int level, void *dst, uint32_t pitch) {
     Tex *t = tget(h); if (!t || !t->tex) return;
+    pend_flush(h); scr_read(h);
     ensure_cmd(); end_encoder(); flush_uploads(cmd);
     mtlr_wait_idle();
     NSUInteger w = MAX(1u, t->d.width >> level), hh = MAX(1u, t->d.height >> level);

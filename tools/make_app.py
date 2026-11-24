@@ -9,7 +9,7 @@ usage: make_app.py BINARY GAME_EXE OUT.app [--name NAME] [--display-name NAME] [
   --name    executable name (default: OUT.app's name)
   --display-name  the name shown in the menu bar, Dock and app switcher (default: --name); may contain characters a
                   file name can't, e.g. a colon, while OUT.app keeps a plain file name
-  --resource  copy FILE into Contents/Resources (as NAME), e.g. the image named by rt_game.image
+  --resource  copy FILE (or a folder) into Contents/Resources (as NAME), e.g. the image named by rt_game.image
   --lib       copy DYLIB into Contents/Frameworks (signed), e.g. a d3d9 backend the runtime dlopens
   --icon      the app icon from IMAGE (any format sips reads; center-cropped to a square) instead of the exe's,
               for games whose exe icon is tiny
@@ -54,9 +54,14 @@ shutil.copy2(binary, os.path.join(macos, app_name))
 # code goes in Frameworks/kosmickrisp, data (ICD json, drirc.d, VERSION) in Resources/kosmickrisp (codesign
 # rejects non-code files among the frameworks); the json points at the driver relative to itself
 kk = os.path.join(os.path.dirname(binary), "kosmickrisp")
-for r in resources:
+for r in resources:   # files or folders
     src, _, name = r.partition("=")
-    shutil.copy2(src, os.path.join(res, name or os.path.basename(src)))
+    dst = os.path.join(res, name or os.path.basename(src.rstrip("/")))
+    if os.path.isdir(src):
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
 for lib in libs:
     os.makedirs(os.path.join(contents, "Frameworks"), exist_ok=True)
     shutil.copy2(lib, os.path.join(contents, "Frameworks", os.path.basename(lib)))

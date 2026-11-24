@@ -8,6 +8,7 @@
 // through its flat API -- the Steam ID, logged-on state, persona name, language, DLC and subscription checks.
 // Offline (no client, or <RT_STEAM_OFFLINE>): as the x86-64 framework does, SteamAPI_Init succeeds, the user is
 // "Player" and logged on, and everything else answers 0.
+#include <stdbool.h>
 #include "rt32.h"
 #include "steam32_slots.h"
 #include <dlfcn.h>
@@ -34,6 +35,18 @@ static struct {
     int (*BIsSubscribedApp)(void *, uint32_t);
     int (*BIsSubscribed)(void *);
     const char *(*GetIPCountry)(void *);
+    // ISteamRemoteStorage of the real client: the game's cloud files go to Steam Cloud (shared with Windows)
+    void *rs;
+    bool (*FileWrite)(void *, const char *, const void *, int32_t);
+    int32_t (*FileRead)(void *, const char *, void *, int32_t);
+    bool (*FileExists)(void *, const char *);
+    bool (*FilePersisted)(void *, const char *);
+    int32_t (*GetFileSize)(void *, const char *);
+    int64_t (*GetFileTimestamp)(void *, const char *);
+    bool (*FileDelete)(void *, const char *);
+    int32_t (*GetFileCount)(void *);
+    const char *(*GetFileNameAndSize)(void *, int, int32_t *);
+    bool (*GetQuota)(void *, uint64_t *, uint64_t *);
 } S;
 
 static void *steam_lib(void) {
@@ -86,6 +99,19 @@ static void connect_client(void) {
     S.user = user_v(); S.friends = friends_v(); S.utils = utils_v(); S.apps = apps_v();
     S.online = S.user && S.friends && S.utils && S.apps;
     rt_log("[steam] online through the Steam client (app %u)", rt_game.steam_app_id);
+    // Steam Cloud: the client keeps these files in Steam/userdata/<account>/<app>/remote and syncs them; without it
+    // (or with RT_STEAM_LOCAL_SAVES) they stay in <data>/userdata/<app>/remote
+    void *(*rs_v)(void) = accessor(h, "SteamRemoteStorage", 16, 14);
+    if (rs_v && !getenv("RT_STEAM_LOCAL_SAVES")) {
+#define RS(field, name) *(void **)&S.field = dlsym(h, "SteamAPI_ISteamRemoteStorage_" name);
+        RS(FileWrite, "FileWrite") RS(FileRead, "FileRead") RS(FileExists, "FileExists") RS(FilePersisted, "FilePersisted")
+        RS(GetFileSize, "GetFileSize") RS(GetFileTimestamp, "GetFileTimestamp") RS(FileDelete, "FileDelete")
+        RS(GetFileCount, "GetFileCount") RS(GetFileNameAndSize, "GetFileNameAndSize") RS(GetQuota, "GetQuota")
+#undef RS
+        if (S.FileWrite && S.FileRead && S.FileExists && S.GetFileSize && S.GetFileTimestamp && S.FileDelete && S.GetFileCount &&
+            S.GetFileNameAndSize && S.GetQuota && S.FilePersisted) S.rs = rs_v();
+        rt_log(S.rs ? "[steam] cloud files through Steam Cloud" : "[steam] Steam Cloud unavailable: cloud files kept locally");
+    }
 }
 
 // ---------------- method implementations (by interface and method name) ----------------
@@ -137,7 +163,8 @@ static uint64_t a_BIsSubscribedApp(CPU *c, Call *call) {
 }
 static uint64_t a_BIsSubscribed(CPU *c, Call *call) { return S.online ? (uint64_t)(S.BIsSubscribed(S.apps) != 0) : 1; }
 
-// ---- ISteamRemoteStorage: the "cloud" files, kept locally in <data>/userdata/<app>/remote (Steam's own layout) ----
+// ---- ISteamRemoteStorage: the "cloud" files: Steam Cloud through the client when it runs (S.rs), else kept locally in
+// <data>/userdata/<app>/remote (Steam's own layout) ----
 #include <dirent.h>
 #include <unistd.h>
 static void rs_path(const char *name, char *out, size_t n) {
@@ -148,6 +175,7 @@ static void rs_mkdirs(char *path) {   // every directory above the file
     for (char *q = path + strlen(rt_data_dir) + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(path, 0755); *q = '/'; }
 }
 static uint64_t rs_FileWrite(CPU *c, Call *call) {   // (const char *file, const void *data, int32 size) -> bool
+    if (S.rs) { int ok = S.FileWrite(S.rs, STR_A(0), A(2) ? G2H(A(1)) : NULL, (int32_t)A(2)); if (rt_verbose) rt_log("[steam] cloud write %s (%u bytes) -> %d", STR_A(0), A(2), ok); return (uint64_t)ok; }
     char p[1400]; rs_path(STR_A(0), p, sizeof p); rs_mkdirs(p);
     FILE *f = fopen(p, "wb"); if (!f) return 0;
     size_t n = A(2) ? fwrite(G2H(A(1)), 1, A(2), f) : 0;
@@ -155,17 +183,33 @@ static uint64_t rs_FileWrite(CPU *c, Call *call) {   // (const char *file, const
     if (rt_verbose) rt_log("[steam] RemoteStorage write %s (%u bytes)", STR_A(0), A(2));
     return n == A(2);
 }
+void rt_auto_event(const char *what);   // cocoa32.m: scripted runs time their menus from the first saved-data read
 static uint64_t rs_FileRead(CPU *c, Call *call) {    // (const char *file, void *data, int32 size) -> int32 bytes read
+    rt_auto_event("load");
+    if (S.rs) return (uint32_t)S.FileRead(S.rs, STR_A(0), G2H(A(1)), (int32_t)A(2));
     char p[1400]; rs_path(STR_A(0), p, sizeof p);
     FILE *f = fopen(p, "rb"); if (!f) return 0;
     size_t n = fread(G2H(A(1)), 1, A(2), f);
     fclose(f);
     return n;
 }
-static uint64_t rs_FileExists(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) == 0; }
-static uint64_t rs_GetFileSize(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint32_t)st.st_size; }
-static uint64_t rs_GetFileTimestamp(CPU *c, Call *call) { char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint64_t)st.st_mtime; }
-static uint64_t rs_FileDelete(CPU *c, Call *call) { char p[1400]; rs_path(STR_A(0), p, sizeof p); return unlink(p) == 0; }
+static uint64_t rs_FileExists(CPU *c, Call *call) {
+    if (S.rs) return (uint64_t)S.FileExists(S.rs, STR_A(0));
+    char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) == 0;
+}
+static uint64_t rs_FilePersisted(CPU *c, Call *call) { if (S.rs) return (uint64_t)S.FilePersisted(S.rs, STR_A(0)); return rs_FileExists(c, call); }
+static uint64_t rs_GetFileSize(CPU *c, Call *call) {
+    if (S.rs) return (uint32_t)S.GetFileSize(S.rs, STR_A(0));
+    char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint32_t)st.st_size;
+}
+static uint64_t rs_GetFileTimestamp(CPU *c, Call *call) {
+    if (S.rs) return (uint64_t)S.GetFileTimestamp(S.rs, STR_A(0));
+    char p[1400]; struct stat st; rs_path(STR_A(0), p, sizeof p); return stat(p, &st) ? 0 : (uint64_t)st.st_mtime;
+}
+static uint64_t rs_FileDelete(CPU *c, Call *call) {
+    if (S.rs) return (uint64_t)S.FileDelete(S.rs, STR_A(0));
+    char p[1400]; rs_path(STR_A(0), p, sizeof p); return unlink(p) == 0;
+}
 static char rs_names[256][260]; static int rs_n;
 static void rs_scan(const char *dir, const char *prefix) {
     DIR *d = opendir(dir); struct dirent *e;
@@ -179,10 +223,21 @@ static void rs_scan(const char *dir, const char *prefix) {
     }
     closedir(d);
 }
-static uint64_t rs_GetFileCount(CPU *c, Call *call) { char p[1400]; rs_path("", p, sizeof p); rs_n = 0; rs_scan(p, ""); return (uint32_t)rs_n; }
+static uint64_t rs_GetFileCount(CPU *c, Call *call) {
+    if (S.rs) return (uint32_t)S.GetFileCount(S.rs);
+    char p[1400]; rs_path("", p, sizeof p); rs_n = 0; rs_scan(p, ""); return (uint32_t)rs_n;
+}
 static uint32_t rs_name_buf;
 static uint64_t rs_GetFileNameAndSize(CPU *c, Call *call) {   // (int index, int32 *size) -> const char *
     int i = (int)A(0);
+    if (S.rs) {
+        int32_t sz = 0; const char *nm = S.GetFileNameAndSize(S.rs, i, &sz);
+        if (A(1)) wr32(A(1), (uint32_t)sz);
+        if (!nm) return 0;
+        if (!rs_name_buf) rs_name_buf = gmalloc(264);
+        snprintf(G2H(rs_name_buf), 260, "%s", nm);
+        return rs_name_buf;
+    }
     if (i < 0 || i >= rs_n) { if (A(1)) wr32(A(1), 0); return 0; }
     char p[1400]; struct stat st; rs_path(rs_names[i], p, sizeof p);
     if (A(1)) wr32(A(1), stat(p, &st) ? 0 : (uint32_t)st.st_size);
@@ -191,6 +246,7 @@ static uint64_t rs_GetFileNameAndSize(CPU *c, Call *call) {   // (int index, int
     return rs_name_buf;
 }
 static uint64_t rs_GetQuota(CPU *c, Call *call) {    // (uint64 *total, uint64 *available) -> bool
+    if (S.rs) { uint64_t t = 0, a = 0; int ok = S.GetQuota(S.rs, &t, &a); if (A(0)) wr64(A(0), t); if (A(1)) wr64(A(1), a); return (uint64_t)ok; }
     if (A(0)) wr64(A(0), 100ull << 20);
     if (A(1)) wr64(A(1), 100ull << 20);
     return 1;
@@ -207,7 +263,7 @@ static const ImplRow impls[] = {
     {"ISteamApps", "BIsDlcInstalled", a_BIsDlcInstalled}, {"ISteamApps", "BIsSubscribedApp", a_BIsSubscribedApp},
     {"ISteamApps", "BIsSubscribed", a_BIsSubscribed}, {"ISteamApps", "BIsAppInstalled", a_BIsSubscribedApp},
     {"ISteamRemoteStorage", "FileWrite", rs_FileWrite}, {"ISteamRemoteStorage", "FileRead", rs_FileRead},
-    {"ISteamRemoteStorage", "FileExists", rs_FileExists}, {"ISteamRemoteStorage", "FilePersisted", rs_FileExists},
+    {"ISteamRemoteStorage", "FileExists", rs_FileExists}, {"ISteamRemoteStorage", "FilePersisted", rs_FilePersisted},
     {"ISteamRemoteStorage", "GetFileSize", rs_GetFileSize}, {"ISteamRemoteStorage", "GetFileTimestamp", rs_GetFileTimestamp},
     {"ISteamRemoteStorage", "FileDelete", rs_FileDelete}, {"ISteamRemoteStorage", "FileForget", ret1},
     {"ISteamRemoteStorage", "GetFileCount", rs_GetFileCount}, {"ISteamRemoteStorage", "GetFileNameAndSize", rs_GetFileNameAndSize},
