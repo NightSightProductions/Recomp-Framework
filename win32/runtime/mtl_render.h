@@ -138,3 +138,5 @@ void mtlr_wait_seq(uint64_t seq);
 // shaders as Metal source batches (mtlr_load_shaders given a folder of batch_*.metal): wait until all are compiled
 void mtlr_wait_shaders(void);
 int mtlr_init_shaders_only(void);   // the Metal device only: load and compile shaders without a game (returns 0 without Metal)
+// threads without an autorelease pool (a game's own threads) that encode: drain it after each frame's work
+void mtlr_drain_pool(void);

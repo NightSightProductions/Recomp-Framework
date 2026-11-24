@@ -20,6 +20,7 @@ void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h);
 #define NTEX 65536
 
 static id<MTLDevice> dev;
+static int tex_live, tex_made, tex_freed;   // textures (stats line)
 static id<MTLCommandQueue> queue;
 static id<MTLBuffer> guest;            // the whole guest window
 static int active, shadow_on = -1;
@@ -269,6 +270,7 @@ static MTLPixelFormat srgb_of(MTLPixelFormat f) {
 static Tex *tget(MtlTex h) { return h && h < ntex ? &texs[h] : NULL; }
 
 MtlTex mtlr_tex_create(const MtlTexDesc *d) {
+    @autoreleasepool {
     if (!active) return 0;
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
     td.textureType = d->type == MTLR_TEX_CUBE ? MTLTextureTypeCube : d->type == MTLR_TEX_3D ? MTLTextureType3D :
@@ -280,6 +282,7 @@ MtlTex mtlr_tex_create(const MtlTexDesc *d) {
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | ((d->usage & MTLR_USE_TARGET) ? MTLTextureUsageRenderTarget : 0);
     td.storageMode = (d->usage & MTLR_USE_TARGET) || d->samples > 1 ? MTLStorageModePrivate : MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    if (t) { tex_live++; tex_made++; }
     if (!t) { rt_log("[mtl] texture %ux%u format %u failed", d->width, d->height, d->format); return 0; }
     pthread_mutex_lock(&tex_mu);
     if (!texs) texs = calloc(NTEX, sizeof *texs);
@@ -301,9 +304,11 @@ MtlTex mtlr_tex_create(const MtlTexDesc *d) {
     } else x->sample = t;
     pthread_mutex_unlock(&tex_mu);
     return h;
+    }
 }
 static void pend_drop(MtlTex h);
 void mtlr_tex_destroy(MtlTex h) {
+    { Tex *y = tget(h); if (y && y->tex) { tex_live--; tex_freed++; if (getenv("RT_RN_CREATES")) { rt_log("[mtl] destroy texture %u %ux%u", h, (unsigned)y->d.width, (unsigned)y->d.height);} } }
     pend_drop(h);
     pthread_mutex_lock(&tex_mu);
     Tex *x = tget(h);
@@ -376,15 +381,18 @@ static void flush_uploads(id<MTLCommandBuffer> cb) {
     pthread_mutex_unlock(&up_mu);
 }
 void mtlr_tex_upload(MtlTex h, int face, int level, const void *data, uint32_t pitch, uint32_t slice) {
+    @autoreleasepool {
     Tex *x = tget(h); if (!x || !x->tex) return;
     uint32_t w = x->d.width >> level, hh = x->d.height >> level, dd = x->d.type == MTLR_TEX_3D ? x->d.depth >> level : 1;
     if (!w) w = 1; if (!hh) hh = 1; if (!dd) dd = 1;
     uint32_t rows; mtlr_tex_level_size(h, level, NULL, &rows);
     uint32_t img = x->d.type == MTLR_TEX_3D ? slice : pitch * rows;
     queue_upload(x, x->d.type == MTLR_TEX_3D ? 0 : face, level, MTLRegionMake3D(0, 0, 0, w, hh, dd), data, pitch, img, (NSUInteger)img * dd);
+    }
 }
 // a sub-rectangle of a level (x, y, w, h in texels; block aligned for compressed formats); data at its first row
 void mtlr_tex_upload_rect(MtlTex h, int face, int level, int x, int y, int w, int hh, const void *data, uint32_t pitch) {
+    @autoreleasepool {
     Tex *t = tget(h); if (!t || !t->tex || w <= 0 || hh <= 0) return;
     int lw = (int)(t->d.width >> level), lh = (int)(t->d.height >> level); if (lw < 1) lw = 1; if (lh < 1) lh = 1;
     if (x + w > lw) w = lw - x; if (y + hh > lh) hh = lh - y;
@@ -392,6 +400,7 @@ void mtlr_tex_upload_rect(MtlTex h, int face, int level, int x, int y, int w, in
     int bw; block_bytes(t->tex.pixelFormat, &bw);
     NSUInteger rows = (NSUInteger)(hh + bw - 1) / (NSUInteger)bw;
     queue_upload(t, face, level, MTLRegionMake2D(x, y, w, hh), data, pitch, (uint32_t)(pitch * rows), pitch * rows);
+    }
 }
 int mtlr_tex_texel_bytes(MtlTex h, int *block) { Tex *t = tget(h); if (!t) { *block = 1; return 4; } return block_bytes(t->tex.pixelFormat, block); }
 static id<MTLTexture> sample_view(Tex *x, int srgb) {
@@ -502,7 +511,7 @@ static void gamma_to(id<MTLTexture> dst, id<MTLTexture> src) {
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
-static uint32_t frame_no;   // frames presented (scratch depth)
+static uint32_t frame_no;
 static void commit_cmd(void);
 // per-frame cost counters (mtlr_frame_stats)
 static double fs_pso_ms, fs_drawable_ms; static int fs_pso_n;
@@ -511,7 +520,24 @@ void mtlr_frame_stats(double *pso_ms, int *pso_n, double *drawable_ms) {
     *pso_ms = fs_pso_ms; *pso_n = fs_pso_n; *drawable_ms = fs_drawable_ms;
     fs_pso_ms = fs_drawable_ms = 0; fs_pso_n = 0;
 }
+// The game's threads are plain threads with no autorelease pool, and Metal returns command buffers, encoders, pass
+// descriptors and drawables autoreleased: without a pool drained now and then they all stay alive (a few GB in
+// minutes). The thread that presents drains its pool once a frame, a thread that encodes calls mtlr_drain_pool after
+// each frame's work, and entry points other threads call have their own.
+static __thread void *frame_pool;
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *);
+void mtlr_drain_pool(void) {   // the calling thread's pool: drained and started again (live objects are held strongly)
+    if (frame_pool) objc_autoreleasePoolPop(frame_pool);
+    frame_pool = objc_autoreleasePoolPush();
+}
+static void present_impl(int interval);
 void mtlr_present(int interval) {
+    if (!frame_pool) frame_pool = objc_autoreleasePoolPush();
+    present_impl(interval);
+    mtlr_drain_pool();
+}
+static void present_impl(int interval) {
     if (!active || !backbuf) return;
     pend_flush(backbuf);
     frame_no++;
@@ -564,8 +590,8 @@ void mtlr_present(int interval) {
         [cmd presentDrawable:dr];
     }
     commit_cmd();
-    if (++dbg[6] % 120 == 0) rt_log("[mtl] last 120 frames: draws %d, no encoder %d, no pipeline %d, passes %d, clears %d+%d, loads skipped %d",
-                                     dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[7]);
+    if (++dbg[6] % 120 == 0) rt_log("[mtl] last 120 frames: draws %d, no encoder %d, no pipeline %d, passes %d, clears %d+%d, loads skipped %d; textures live %d (made %d, freed %d)",
+                                     dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[7], tex_live, tex_made, tex_freed);
     if (dbg[6] % 120 == 0) memset(dbg, 0, sizeof dbg);
 }
 // fences: a GPU sync point the CPU can poll (D3D event queries). Command buffers are numbered as committed.
@@ -879,6 +905,7 @@ void mtlr_speculate_config(const uint32_t color[4], uint32_t depth, int alpha_te
 static int spec_n;
 static Map spec_pairs;   // debug (RT_RN_LEAD): shader pairs speculated
 void mtlr_speculate(uint32_t vs, uint32_t ps, uint32_t layout, int rank) {
+    @autoreleasepool {
     if (!active || !mtlr_shader_info(vs) || !mtlr_shader_info(ps) || layout >= (uint32_t)nlayouts) return;
     { uint32_t pr[2] = {vs, ps}; pthread_mutex_lock(&pso_mu); map_set(&spec_pairs, pr, 8, fnv(pr, 8), (void *)(uintptr_t)(layout + 1)); pthread_mutex_unlock(&pso_mu); }
     FragCfg best[8]; int nb = 0;
@@ -902,6 +929,7 @@ void mtlr_speculate(uint32_t vs, uint32_t ps, uint32_t layout, int rank) {
         k.srgb_mask = best[i].srgb_mask; k.alpha_test = best[i].alpha_test; memcpy(k.blend, best[i].blend, sizeof k.blend);
         for (int j = 0; j < layouts[layout].n; j++) k.strides[layouts[layout].e[j].stream] = 1;
         spec_n += pso_async(&k);
+    }
     }
 }
 int mtlr_speculated(void) { return spec_n; }
@@ -1323,7 +1351,10 @@ static void begin_pass(int clear, const float color[4], float depth, uint8_t ste
             }
         }
     }
-    if (!p.colorAttachments[0].texture && !dx) return;
+    if (!p.colorAttachments[0].texture && !dx) {
+        static int n; if (n++ < 3) { Tex *cx = tget(st.color[0].tex); rt_log("[mtl] no attachments: color0 %u (%s) depth %u", st.color[0].tex, cx ? (cx->tex ? "live" : "destroyed") : "none", st.depth.tex); }
+        return;
+    }
     if (pass_log) {
         if (!pass_cs) {
             id<MTLCounterSet> ts = nil;
@@ -1678,6 +1709,7 @@ void mtlr_debug_dump(const char *dir) {
 
 // read a level back to host memory (waits for the GPU): render-target readback (screenshots, save thumbnails)
 void mtlr_tex_download(MtlTex h, int face, int level, void *dst, uint32_t pitch) {
+    @autoreleasepool {
     Tex *t = tget(h); if (!t || !t->tex) return;
     pend_flush(h); scr_read(h);
     ensure_cmd(); end_encoder(); flush_uploads(cmd);
@@ -1696,4 +1728,5 @@ void mtlr_tex_download(MtlTex h, int face, int level, void *dst, uint32_t pitch)
               toBuffer:b destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * rows];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     memcpy(dst, b.contents, pitch * rows);
+    }
 }

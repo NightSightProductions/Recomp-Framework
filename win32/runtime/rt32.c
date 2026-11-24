@@ -496,9 +496,10 @@ static void process_init(void) {
 
 char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
 // Launched from Finder or by Steam (stderr isn't a terminal): the log goes to ~/Library/Logs/<name>.log, with the
-// previous sessions' logs kept as <name>.prev.log to .prev4.log (as the 64-bit runtime does)
+// previous sessions' logs kept as <name>.prev.log to .prev4.log (as the 64-bit runtime does); RT_LOG_STDERR=1 keeps it
+// on stderr
 void rt_log_to_file(const char *name) {
-    if (isatty(2)) return;
+    if (isatty(2) || getenv("RT_LOG_STDERR")) return;   // RT_LOG_STDERR=1: scripts reading the output keep it
     char log[1100], a[1100], b[1100];
     snprintf(log, sizeof log, "%s/Library/Logs/%s.log", getenv("HOME") ? getenv("HOME") : "/tmp", name);
     int stem = (int)(strlen(log) - 4);
