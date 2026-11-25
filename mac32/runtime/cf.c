@@ -657,15 +657,25 @@ void I__SetWindowProxyCreatorAndType(CPU *c) { RET(0); }
 #include <sys/stat.h>
 #define NFSPATH 8192
 static char *fspaths[NFSPATH]; static int nfspaths = 1;
+// The table is shared by every guest thread. Without the lock, two threads making FSRefs at once could see the count
+// grow before the new slot was filled and compare against a NULL path (a crash at address 0 at startup, when the
+// rendering thread and the game thread both open files).
+static pthread_mutex_t fslock = PTHREAD_MUTEX_INITIALIZER;
 static void fsref_set(uint32_t addr, const char *path) {
     int i = 0;
+    pthread_mutex_lock(&fslock);
     for (int k = 1; k < nfspaths; k++) if (!strcmp(fspaths[k], path)) { i = k; break; }
-    if (!i) { if (nfspaths >= NFSPATH) { fprintf(stderr, "[fs] FSRef table full\n"); abort(); } i = nfspaths++; fspaths[i] = strdup(path); }
+    if (!i) { if (nfspaths >= NFSPATH) { fprintf(stderr, "[fs] FSRef table full\n"); abort(); } i = nfspaths; fspaths[i] = strdup(path); nfspaths = i + 1; }
+    pthread_mutex_unlock(&fslock);
     memset(G2H(addr), 0, 80); wr32(addr, 0x46535246); wr32(addr + 4, (uint32_t)i);
 }
 static const char *fsref_path(uint32_t addr) {
     if (!addr || rd32(addr) != 0x46535246) return NULL;
-    uint32_t i = rd32(addr + 4); return (i > 0 && i < (uint32_t)nfspaths) ? fspaths[i] : NULL;
+    uint32_t i = rd32(addr + 4);
+    pthread_mutex_lock(&fslock);
+    const char *p = (i > 0 && i < (uint32_t)nfspaths) ? fspaths[i] : NULL;
+    pthread_mutex_unlock(&fslock);
+    return p; // never freed, so safe to use after unlocking
 }
 static void mkdirs(const char *p) {
     char t[2048]; snprintf(t, sizeof t, "%s", p);

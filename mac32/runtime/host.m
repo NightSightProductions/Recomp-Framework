@@ -378,7 +378,7 @@ static int probe_q_active = -1, probe_q_state = 0; // state: 0 untested, 1 worki
 static int probe_q_ended[2];
 static struct {
     int n, gpu_n, b[4];
-    double dt, gpu, gpu_max, gl, wait;
+    double dt, gpu, gpu_max, gl, wait, cpu;
 } probe_acc;
 static double probe_ms(uint64_t ticks) {
     static mach_timebase_info_data_t tb;
@@ -390,8 +390,11 @@ static double probe_ms(uint64_t ticks) {
 static void probe_before_swap(int present) {
     extern volatile uint64_t gl_ticks_total, gl_slow_ticks;
     extern const char *volatile gl_slow_name;
-    static uint64_t t_last, gl_last;
+    static uint64_t t_last, gl_last, cpu_last;
     uint64_t now = mach_absolute_time();
+    // CPU time this thread used per frame. Unlike the frame interval it is not hidden by a frame-rate cap, so it
+    // shows small CPU savings (or costs) directly.
+    uint64_t cpu_now = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     if (probe_q_state == 0 && getenv("RT32_NO_GPU_TIME"))
         probe_q_state = -1;
     if (probe_q_state >= 0) {
@@ -434,6 +437,8 @@ static void probe_before_swap(int present) {
         probe_acc.dt += dt;
         probe_acc.gl += gl;
         probe_acc.wait += wait;
+        if (cpu_now >= cpu_last)
+            probe_acc.cpu += (double)(cpu_now - cpu_last) / 1e6;
         probe_acc.b[dt <= 18.0 ? 0 : dt <= 27.0 ? 1 : dt <= 36.0 ? 2 : 3]++;
         if (dt > 50.0)
             fprintf(stderr,
@@ -444,10 +449,10 @@ static void probe_before_swap(int present) {
             fprintf(stderr,
                     "[frame] last 100 frames: interval %.1f ms | GPU avg %.1f max %.1f ms (%d samples) | GL calls %.1f "
                     "ms CPU | waiting for the display %.1f ms | pacing: %d at <=18 ms, %d at 18-27, %d at 27-36, %d "
-                    "slower\n",
+                    "slower | render thread CPU %.2f ms\n",
                     probe_acc.dt / 100, probe_acc.gpu_n ? probe_acc.gpu / probe_acc.gpu_n : 0.0, probe_acc.gpu_max,
                     probe_acc.gpu_n, probe_acc.gl / 100, probe_acc.wait / 100, probe_acc.b[0], probe_acc.b[1],
-                    probe_acc.b[2], probe_acc.b[3]);
+                    probe_acc.b[2], probe_acc.b[3], probe_acc.cpu / 100);
             {
                 extern volatile uint32_t gl_sh_new, gl_sh_repeat;
                 extern volatile uint64_t gl_sh_new_ticks, gl_sh_repeat_ticks;
@@ -467,6 +472,7 @@ static void probe_before_swap(int present) {
     }
     t_last = now;
     gl_last = gl_ticks_total;
+    cpu_last = cpu_now;
     host_probe_wait_ticks = 0;
     gl_slow_ticks = 0;
 }

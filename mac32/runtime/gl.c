@@ -190,6 +190,7 @@ static void gl_samples_step(const char *name) {
 // CPU is currently inside one (read by the sampler in sys.c)
 #include <mach/mach_time.h>
 volatile CPU *gl_in_cpu; volatile uint64_t gl_ticks_total; static uint64_t gl_t0;
+static int gl_call_timing = 1; // 0 with RT32_NO_CALL_TIMING=1 (set in gl_enter)
 // once the game renders on its own thread, AppKit still updates the context's drawable from the main
 // thread (window activation, resize, screen change). Seen as a crash in gldUpdateDrawFramebuffer during glBlitFramebuffer
 // at startup (2 of ~6 runs). Each GL call now holds the context's CGL lock, and the main-thread update takes the same
@@ -206,11 +207,17 @@ void gl_enter(CPU *c) {
         mach_timebase_info(&tb);
         const char *e = getenv("RT32_SLOWCALL_MS"); // default 8 ms; 0 turns the log off
         double ms = e ? atof(e) : 8.0;
+        // RT32_NO_CALL_TIMING=1 skips the two clock reads around every GL call (about 0.2 ms per frame at ~23,000
+        // calls). The frame probe then reports 0 ms inside GL calls, and [slowcall] / [hitch+] cannot name the call.
+        gl_call_timing = !getenv("RT32_NO_CALL_TIMING");
+        if (!gl_call_timing)
+            ms = 0;
         gl_slow_limit = ms > 0 ? (uint64_t)(ms * 1e6 * tb.denom / tb.numer) : ~0ull - 1;
     }
     gl_ctx_lock();
     gl_in_cpu = c;
-    gl_t0 = mach_absolute_time();
+    if (gl_call_timing)
+        gl_t0 = mach_absolute_time();
 }
 // the slowest single GL call since the host last asked (frame probe in host.m). A hitch caused by
 // the driver compiling a shader or pipeline shows up as one very long draw, link or compile call.
@@ -240,16 +247,18 @@ static void gl_slow_report(uint64_t d) {
 volatile uint64_t gl_slow_ticks;
 const char *volatile gl_slow_name = "";
 void gl_leave(void) {
-    uint64_t d = mach_absolute_time() - gl_t0;
-    gl_ticks_total += d;
-    if (d > gl_slow_ticks) {
-        gl_slow_ticks = d;
-        gl_slow_name = gl_cur_name;
+    if (gl_call_timing) {
+        uint64_t d = mach_absolute_time() - gl_t0;
+        gl_ticks_total += d;
+        if (d > gl_slow_ticks) {
+            gl_slow_ticks = d;
+            gl_slow_name = gl_cur_name;
+        }
+        if (__builtin_expect(d > gl_slow_limit, 0))
+            gl_slow_report(d);
+        if (gl_hist_cur >= 0)
+            gl_hist_t[gl_hist_cur] += d;
     }
-    if (__builtin_expect(d > gl_slow_limit, 0))
-        gl_slow_report(d);
-    if (gl_hist_cur >= 0)
-        gl_hist_t[gl_hist_cur] += d;
     gl_in_cpu = NULL;
     gl_ctx_unlock();
 }
