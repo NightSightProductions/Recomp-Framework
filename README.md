@@ -210,12 +210,14 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
   | OpenGL (legacy profile on CGL) with the engine's viewport mapped onto Retina drawables | `gl.c` + generated entry points |
   | FMOD Ex on CoreAudio, Ogg Vorbis through stb_vorbis | `fmod.c`, `vorbis.c` |
   | Steamworks of the period, offline (stats and achievements stored locally) | `steam.c` |
+  | Game controllers through the GameController framework, in XInput's layout | `pad.m` |
   | The app host: window, OpenGL view, input, fullscreen, screenshots, scripted input, MetalFX upscaling, a statistics overlay, frame pacing | `host.m` |
 
 - **Porting.** The host drives the game through a few hooks the game project implements (`mac32/runtime/game32.h`):
   start, frame, window size, quit, and input. They usually call the engine's own C entry points: the ones the
   original app's Cocoa code called. Engine functions that talked to the old OS are replaced natively through
-  `--hle` (`address name` per line, implemented as `H_<name>`).
+  `--hle` (`address name` per line, implemented as `H_<name>`). A project can name the one executable it was made
+  for (`exe_sha256` in `rt32_game`); the host then refuses other builds with a clear message.
 - **Diagnostics.**
   - `RT32_SHOT`, `RT32_EXIT_AFTER`, `RT32_INPUT`: screenshots, timed exits and scripted input for automated runs.
   - `RT32_STRICT`: abort on unimplemented imports.

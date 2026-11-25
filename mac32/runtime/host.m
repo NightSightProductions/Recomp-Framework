@@ -13,6 +13,7 @@
 #define GL_SILENCE_DEPRECATION
 #import <Cocoa/Cocoa.h>
 #include <os/lock.h>
+#include <CommonCrypto/CommonDigest.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <MetalFX/MetalFX.h>
@@ -982,6 +983,8 @@ static void confine_pointer(NSWindow *w) {
             uint8_t ch = held_k == 36 ? 13 : held_k == 49 ? ' ' : held_k == 53 ? 27 : 0;
             rt_carbon_key(held_k, ch, 0, 1);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ rt_hid_key_event(held_k, 0); rt_carbon_key(held_k, ch, 0, 0); });
+        } else if (!strncmp(act, "pad:", 4)) { // controller buttons (XInput bits, e.g. 0x1000 = A) held for 12 polls
+            host_pad_script((uint16_t)strtoul(act + 4, NULL, 0), 12);
         }
         else if (!strncmp(act, "key:", 4)) {
             uint32_t k = (uint32_t)(act[4] == '#' ? strtoul(act + 5, NULL, 0) : (uint8_t)act[4]);
@@ -1092,6 +1095,59 @@ static NSString *find_game(void) {
     return p;
 }
 
+// version check. A recompiled port only fits the exact executable it was generated from: the
+// translated code, the function list and every hard-coded address are positions inside that file. With any other
+// build (another store's version, a patch) it would start and then fail in confusing ways, so compare the file's
+// SHA-256 with the one the game project declares (rt32_game.exe_sha256) and stop with a clear message if it differs.
+// Returns 1 to continue. RT32_SKIP_VERSION_CHECK=1 skips it (for experiments with other builds).
+static int check_game_binary(const char *path, BOOL interactive) {
+    if (!rt32_game.exe_sha256 || getenv("RT32_SKIP_VERSION_CHECK"))
+        return 1;
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 1; // not readable: the loader reports that in its own words
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    static unsigned char buf[1 << 20];
+    size_t n;
+    unsigned long long total = 0;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
+        total += n;
+    }
+    fclose(f);
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(md, &ctx);
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    const char *ver = rt32_game.exe_version ? rt32_game.exe_version : rt32_game.name;
+    if (!strcasecmp(hex, rt32_game.exe_sha256)) {
+        fprintf(stderr, "[host] game executable verified: %s (sha256 %.16s..., %llu bytes)\n", ver, hex, total);
+        return 1;
+    }
+    fprintf(stderr,
+            "[host] WRONG GAME VERSION: %s\n[host]   this port was built for: %s\n[host]   expected sha256 %s\n"
+            "[host]   found    sha256 %s (%llu bytes)\n[host]   RT32_SKIP_VERSION_CHECK=1 starts it anyway (it will "
+            "very likely crash)\n",
+            path, ver, rt32_game.exe_sha256, hex, total);
+    if (interactive) {
+        [NSApplication sharedApplication];
+        NSAlert *a = [NSAlert new];
+        a.alertStyle = NSAlertStyleCritical;
+        a.messageText = [NSString stringWithFormat:@"This copy of %s is a different version", rt32_game.name];
+        a.informativeText = [NSString
+            stringWithFormat:@"This port only works with one exact build of the game:\n%s\n\nThe copy at\n%s\nis a "
+                             @"different build (another store's version, or a newer or older patch), so the port "
+                             @"cannot run it.\n\nDetails are in the log file.",
+                             ver, path];
+        [a addButtonWithTitle:@"Quit"];
+        [a runModal];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"GamePath"]; // ask again next time
+    }
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         const char *bin = argc > 2 && argv[1][0] != '-' ? argv[1] : NULL;
@@ -1111,6 +1167,8 @@ int main(int argc, const char **argv) {
             snprintf(resources_dir, sizeof resources_dir, "%s/Contents/Resources", game.UTF8String);
             bin = binbuf;
         } else snprintf(resources_dir, sizeof resources_dir, "%s", res);
+        if (!check_game_binary(bin, argc <= 2 || argv[1][0] == '-'))
+            return 1;
         gcpu = rt_init(bin);
         if (chdir(resources_dir)) { perror(resources_dir); return 1; }
         // Steam games ship steam_appid.txt next to the executable

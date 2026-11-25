@@ -13,6 +13,8 @@ const Rt32Game rt32_game = {
     .support_dir = "MyGame-recomp",
     .log_name = "MyGame-recomp",
     .width = 1024, .height = 768,
+    // .exe_sha256 = "<output of: shasum -a 256 MyGame.app/Contents/MacOS/MyGame>",  // refuse other builds of the game
+    // .exe_version = "MyGame 1.0 (Steam, Mac)",
 };
 
 static uint32_t call0(CPU *c, const char *sym) { return guest_call(c, guest_func(sym), 0, NULL); }
