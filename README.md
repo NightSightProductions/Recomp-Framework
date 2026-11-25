@@ -172,13 +172,18 @@ python3 tools/nsr.py list
   finishes at once); `--force-exe` always passes one exe from the game folder.
 - NotProton plugins in `~/Library/Application Support/notproton/plugins/*.conf` that are switched on for the game are
   applied as NotProton's own launcher does: `inject` loads the plugin's dylib after Steam's overlay, `env` lines and
-  `NOTPROTON_ENV_<NAME>` options set variables, and `depends`, `requires` and `tools` (the tool's name is `nsr`) are
-  honoured.
+  `NOTPROTON_ENV_<NAME>` options set variables, and `depends`, `requires` and `tools` (the tool's name is `nsr_proton`; `nsr`, its earlier
+  name, matches too) are honoured.
 - A game's environment (plugin switches such as `NOTPROTON_<ID>=1`, runtime settings) is set with
   `nsr.py set-env --appid <id> NAME=value ...` and kept in games.conf. Leave the game's Steam launch options empty:
   Steam for Mac starts a launch with options as `env VAR=value <tool>`, which fails ("OS Error 260") for any
   compatibility tool other than NotProton's own.
-- Each launch is logged to `~/Library/Logs/nsr.log`. Games live in `compatibilitytools.d/nsr/games.conf`, one line
+- The tool's ID is `nsr_proton`. Steam for Mac maps a game's Steam Auto-Cloud rules for Windows paths (Saved Games,
+  Documents, AppData) into the tool's prefix, `steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser`, only for a
+  tool whose name contains "proton", and skips every rule otherwise. A port whose Windows release syncs saves with
+  Auto-Cloud saves into that prefix to share them with Windows. `nsr.py install` moves an install from before this
+  (ID `nsr`) over: its games, and Steam's per-game tool choices when Steam is closed.
+- Each launch is logged to `~/Library/Logs/nsr_proton.log`. Games live in `compatibilitytools.d/nsr_proton/games.conf`, one line
   each.
 
 ## 32-bit Intel Mac games (`mac32/`)

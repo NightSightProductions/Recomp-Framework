@@ -3,9 +3,15 @@
 
 Steam for Mac has the same compatibility-tool support as Steam on Linux, switched off; NotProton
 (github.com/NotProtonNot/NotProton) switches it on. NSR registers a single tool, "NightSight Recomp (NSR)", in
-~/Library/Application Support/Steam/compatibilitytools.d/nsr. Choose it for a game (the game > Properties >
+~/Library/Application Support/Steam/compatibilitytools.d/nsr_proton. Choose it for a game (the game > Properties >
 Compatibility > Force the use of a specific Steam Play compatibility tool) and Play on the game's own library entry
 starts its native app on the Windows release Steam installed, with playtime, presence and the Steam overlay.
+
+The tool's ID contains "proton" on purpose: Steam for Mac maps a game's Steam Auto-Cloud rules for Windows paths
+(Saved Games, Documents, AppData...) into the tool's prefix, steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser,
+only for a tool whose name contains "proton"; for any other tool it skips every rule, so saves that the Windows
+release syncs with Auto-Cloud never sync on the Mac. A port saves into that prefix to share them with Windows.
+`install` moves games registered with the tool's earlier ID, "nsr", over to it (see cmd_install).
 
 Steam calls the tool's `run` launcher with the game's Windows exe and SteamAppId in the environment. The launcher
 looks the app ID up in games.conf (next to it) and starts that game's .app. Adding a game is a config edit.
@@ -31,7 +37,7 @@ usage:
   nsr.py remove --appid 201810
   nsr.py list
   nsr.py uninstall
-  (every command takes --id <tool id>, default "nsr")
+  (every command takes --id <tool id>, default "nsr_proton"; keep "proton" in it, see above)
 
   --exe          glob (case-insensitive) for the Windows exe Steam starts as the game; anything else Steam runs first
                  (redistributable installers, helpers) finishes at once. If left out, the game's exe is found in its
@@ -51,7 +57,8 @@ NSR replaces.
 import os, plistlib, shutil, subprocess, sys, tempfile
 
 TOOLS = os.environ.get("NSR_TOOLS_DIR") or os.path.expanduser("~/Library/Application Support/Steam/compatibilitytools.d")
-DEFAULT_ID, DEFAULT_DISPLAY = "nsr", "NightSight Recomp (NSR)"
+DEFAULT_ID, DEFAULT_DISPLAY = "nsr_proton", "NightSight Recomp (NSR)"
+LEGACY_ID = "nsr"   # the tool's ID before it had to contain "proton" (Auto-Cloud); `install` migrates it
 
 DECLARATION = '''"compatibilitytools"
 {
@@ -195,7 +202,8 @@ static int for_tool(const char *id) {   /* "tools" names the tools a plugin is f
     for (int i = 0; i < nfields; i++)
         if (!strcmp(fields[i].id, id) && !strcmp(fields[i].key, "tools") && *fields[i].val) {
             any = 1;
-            if (fnmatch(fields[i].val, TOOL_ID, 0) == 0) return 1;
+            /* also the tool's earlier ID, "nsr", for plugins written before the rename */
+            if (fnmatch(fields[i].val, TOOL_ID, 0) == 0 || fnmatch(fields[i].val, "nsr", 0) == 0) return 1;
         }
     return !any;
 }
@@ -417,7 +425,75 @@ def cmd_install(a):
     open(os.path.join(tool, "toolmanifest.vdf"), "w").write(MANIFEST)
     conf = os.path.join(tool, "games.conf")
     write_conf(conf, read_conf(conf))   # creates it, or keeps the games already there
-    print("installed %s (%s)\nrestart Steam if it is running, then add games with `add`" % (tool, display))
+    print("installed %s (%s)" % (tool, display))
+    if tid == DEFAULT_ID:
+        migrate_legacy(tool)
+    print("restart Steam if it is running, then add games with `add`")
+
+
+def steam_running():
+    return subprocess.run(["pgrep", "-x", "steam_osx"], capture_output=True).returncode == 0
+
+
+def remap_steam(old, new):
+    """Point every per-game tool choice in Steam (config.vdf, CompatToolMapping) that names the old tool ID at the new
+    one: that tool no longer exists, so Steam could not start those games. Steam rewrites
+    config.vdf while it runs, so this only happens with Steam closed. Returns the app IDs changed, or None."""
+    if steam_running():
+        return None
+    vdf = os.path.join(os.environ.get("NSR_STEAM_ROOT") or os.path.dirname(TOOLS), "config", "config.vdf")
+    if not os.path.isfile(vdf):
+        return []
+    lines = open(vdf, encoding="utf-8").read().split("\n")
+    done, depth, in_map, app = [], 0, False, None
+    for i, line in enumerate(lines):
+        t = line.strip()
+        if t == '"CompatToolMapping"':
+            in_map, depth = True, 0
+            continue
+        if not in_map:
+            continue
+        if t == "{":
+            depth += 1
+        elif t == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif depth == 1 and t.startswith('"') and t.endswith('"') and t.count('"') == 2:
+            app = t.strip('"')
+        elif depth == 2 and app and t.split() == ['"name"', '"%s"' % old]:
+            lines[i] = line.replace('"%s"' % old, '"%s"' % new)
+            done.append(app)
+    if done:
+        shutil.copy2(vdf, vdf + ".nsr-backup")
+        open(vdf, "w", encoding="utf-8").write("\n".join(lines))
+    return done
+
+
+def migrate_legacy(tool):
+    """Move games from the tool's earlier ID ("nsr") into this one, point Steam's choices of it at this one, and remove
+    the old tool. The new tool shows the same name, so nothing changes for the player apart from cloud saves.
+    Safe to run again: with Steam running, the old tool is kept until a later run can switch Steam's choices."""
+    old = os.path.join(TOOLS, LEGACY_ID)
+    if os.path.isdir(old):
+        conf = os.path.join(tool, "games.conf")
+        rows = read_conf(conf)
+        have = {r[0] for r in rows}
+        moved = [r for r in read_conf(os.path.join(old, "games.conf")) if r[0] not in have]
+        write_conf(conf, rows + moved)
+        if moved:
+            print("copied %d game(s) from the earlier tool ID \"%s\"" % (len(moved), LEGACY_ID))
+    remapped = remap_steam(LEGACY_ID, DEFAULT_ID)
+    if remapped is None:
+        if os.path.isdir(old):   # Steam's choices may still name the old tool: keep it working until they are switched
+            print("Steam is running, so the old tool \"%s\" is kept for now: quit Steam and run `install` again to finish"
+                  " (or choose NightSight Recomp (NSR) again for each game)" % LEGACY_ID)
+        return
+    if remapped:
+        print("Steam's compatibility choice switched to the new tool for app(s) %s" % ", ".join(sorted(remapped)))
+    if os.path.isdir(old):
+        shutil.rmtree(old, ignore_errors=True)
+        print("removed the old tool %s" % old)
 
 
 HELPER_EXES = ("unitycrashhandler", "vcredist", "vc_redist", "dxsetup", "dotnet", "unins", "setup", "install",
