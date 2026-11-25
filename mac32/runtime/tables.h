@@ -13,6 +13,8 @@ extern const GPtr gptrs[];   extern const int ngptrs;
 extern const GSeg gsegs[];   extern const int ngsegs;
 extern const uint32_t gmodinit[]; extern const int ngmodinit;
 extern const GPtr gextrel[]; extern const int ngextrel;
+typedef struct { const char *name; uint32_t addr; } GDef;   // data symbol defined in the game binary
+extern const GDef gdefs[]; extern const int ngdefs;
 
 void unimpl_import(CPU *c, const char *name);
 CPU *rt_init(const char *binpath);
@@ -27,3 +29,10 @@ uint32_t gstrdup(const char *s);
 uint32_t rt_host_fn(gfn f);   // native function -> guest-callable address (cdecl, ret popped by caller of call_ind)
 uint32_t rt_host_fn_ctx(void (*f)(CPU *, uint32_t), uint32_t ctx);
 uint32_t rt_import_addr(const char *name);   // stub address for functions, placeholder storage for data
+// C++ exception tables (from __eh_frame / __gcc_except_tab)
+typedef struct { uint32_t lo, hi; } GFde;
+typedef struct { uint32_t lo, hi, lp, fn; int32_t act, nact; } GEHSite;   // nact 0: cleanup only
+typedef struct { int32_t filter; uint32_t ti, indirect; } GEHAct;          // ti 0 with filter > 0: catch (...)
+extern const GFde gfdes[]; extern const int ngfdes;
+extern const GEHSite gehsites[]; extern const int ngehsites;
+extern const GEHAct gehacts[]; extern const int ngehacts;

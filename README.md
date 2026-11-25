@@ -190,6 +190,7 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
 |---|---|
 | `mac32/tools/recomp32.py` | The translator: i386 Mach-O → C (`recomp32.py BINARY LO HI OUTDIR [--hle FILE]`) |
 | `mac32/tools/macho.py` | Mach-O reader: segments, sections, function symbols, import stubs and pointers |
+| `mac32/tools/eh32.py` | Reads `__eh_frame` and `__gcc_except_tab`, so translated code can throw and catch C++ exceptions |
 | `mac32/tools/glgen.py` | Generates the OpenGL entry points from a signature table |
 | `mac32/runtime/` | The 32-bit runtime and the Cocoa/OpenGL host |
 | `mac32/template/`, `mac32/mac32.mk` | Starting point and build rules for a game project |
@@ -202,7 +203,7 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
 
   | Area | |
   |---|---|
-  | C library, threads, and the C++ runtime of GCC 4.2's libstdc++ (RTTI and `dynamic_cast`, iostreams) | `libc2.c`, `shims.c`, `sys.c`, `cxx.c` |
+  | C library, threads, and the C++ runtime of GCC 4.2's libstdc++ (RTTI and `dynamic_cast`, iostreams, copy-on-write strings, exceptions) | `libc2.c`, `shims.c`, `sys.c`, `cxx.c`, `cxxstr.c`, `eh.c` |
   | CoreFoundation, CoreGraphics display modes and preferences | `cf.c` |
   | OpenGL (legacy profile on CGL) with the engine's viewport mapped onto Retina drawables | `gl.c` + generated entry points |
   | FMOD Ex on CoreAudio, Ogg Vorbis through stb_vorbis | `fmod.c`, `vorbis.c` |

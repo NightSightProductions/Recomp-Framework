@@ -38,7 +38,7 @@ $(BUILD)/gl_gen.c: $(M32)/tools/glgen.py
 
 GEN_SRC = $(wildcard $(GEN_DIR)/code_*.c) $(GEN_DIR)/tables.c
 GEN_OBJ = $(patsubst %.c,$(BUILD)/%.o,$(GEN_SRC))
-M32_RT  = rt.c shims.c sys.c cxx.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c
+M32_RT  = rt.c shims.c sys.c cxx.c cxxstr.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c eh.c
 RT_OBJ  = $(patsubst %.c,$(BUILD)/m32/%.o,$(M32_RT)) $(BUILD)/m32/host.o $(BUILD)/gl_gen.o
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
 M32_HDR = $(wildcard $(M32)/runtime/*.h)
