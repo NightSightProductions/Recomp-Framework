@@ -38,7 +38,13 @@ $(BUILD)/gl_gen.c: $(M32)/tools/glgen.py
 
 GEN_SRC = $(wildcard $(GEN_DIR)/code_*.c) $(GEN_DIR)/tables.c
 GEN_OBJ = $(patsubst %.c,$(BUILD)/%.o,$(GEN_SRC))
-M32_RT  = rt.c shims.c sys.c cxx.c cxxstr.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c eh.c
+M32_RT  = rt.c shims.c sys.c cxx.c cxxstr.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c objc.c eh.c bink.c
+# Bink movies decode through FFmpeg when it is installed (brew install ffmpeg); otherwise they play as black frames
+FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil 2>/dev/null)
+FFMPEG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil 2>/dev/null)
+ifneq ($(FFMPEG_LIBS),)
+FFMPEG_CFLAGS += -DHAVE_FFMPEG
+endif
 RT_OBJ  = $(patsubst %.c,$(BUILD)/m32/%.o,$(M32_RT)) $(BUILD)/m32/host.o $(BUILD)/gl_gen.o
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
 M32_HDR = $(wildcard $(M32)/runtime/*.h)
@@ -52,6 +58,7 @@ $(BUILD)/m32/vorbis.o: $(M32)/runtime/vorbis.c $(M32_HDR)
 $(BUILD)/m32/%.o: $(M32)/runtime/%.c $(M32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/m32/bink.o: CFLAGS += $(FFMPEG_CFLAGS)
 $(BUILD)/m32/host.o: $(M32)/runtime/host.m $(M32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
@@ -63,10 +70,10 @@ $(BUILD)/game/%.o: %.c $(M32_HDR)
 $(BUILD)/libgame32.a: $(GEN_OBJ)
 	rm -f $@; ar rcs $@ $^
 
-FRAMEWORKS = -framework CoreFoundation -framework ApplicationServices -framework Cocoa -framework OpenGL \
+FRAMEWORKS = -framework CoreFoundation -framework ApplicationServices -framework Cocoa -framework Carbon -framework OpenGL \
              -framework AudioToolbox -framework CoreAudio
 $(BUILD)/$(APP_NAME): $(BUILD)/libgame32.a $(RT_OBJ) $(GAME_OBJ)
-	$(CC) $(CFLAGS) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/libgame32.a -lz -lc++ $(FRAMEWORKS) -o $@
+	$(CC) $(CFLAGS) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/libgame32.a -lz -lc++ $(FFMPEG_LIBS) $(FRAMEWORKS) -o $@
 app: $(BUILD)/$(APP_NAME)
 # the runtime alone (no translated game): a quick compile check
 runtime: $(RT_OBJ) $(GAME_OBJ)

@@ -204,7 +204,9 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
   | Area | |
   |---|---|
   | C library, threads, and the C++ runtime of GCC 4.2's libstdc++ (RTTI and `dynamic_cast`, iostreams, copy-on-write strings, exceptions) | `libc2.c`, `shims.c`, `sys.c`, `cxx.c`, `cxxstr.c`, `eh.c` |
-  | CoreFoundation, CoreGraphics display modes and preferences | `cf.c` |
+  | CoreFoundation, CoreGraphics display modes and preferences, Carbon events, IOKit queries | `cf.c` |
+  | Objective-C 1.0 message dispatch for the little Cocoa a game's wrapper code uses | `objc.c` |
+  | Bink movies, decoded by FFmpeg when it is installed (black frames otherwise) | `bink.c` |
   | OpenGL (legacy profile on CGL) with the engine's viewport mapped onto Retina drawables | `gl.c` + generated entry points |
   | FMOD Ex on CoreAudio, Ogg Vorbis through stb_vorbis | `fmod.c`, `vorbis.c` |
   | Steamworks of the period, offline (stats and achievements stored locally) | `steam.c` |
