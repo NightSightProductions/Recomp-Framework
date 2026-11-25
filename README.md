@@ -210,7 +210,7 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
   | OpenGL (legacy profile on CGL) with the engine's viewport mapped onto Retina drawables | `gl.c` + generated entry points |
   | FMOD Ex on CoreAudio, Ogg Vorbis through stb_vorbis | `fmod.c`, `vorbis.c` |
   | Steamworks of the period, offline (stats and achievements stored locally) | `steam.c` |
-  | The app host: window, OpenGL view, input, fullscreen, screenshots, scripted input | `host.m` |
+  | The app host: window, OpenGL view, input, fullscreen, screenshots, scripted input, MetalFX upscaling, a statistics overlay, frame pacing | `host.m` |
 
 - **Porting.** The host drives the game through a few hooks the game project implements (`mac32/runtime/game32.h`):
   start, frame, window size, quit, and input. They usually call the engine's own C entry points: the ones the
@@ -221,6 +221,11 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
   - `RT32_STRICT`: abort on unimplemented imports.
   - `RT32_WATCH`, `RT32_MEMWATCH`, and `-DMEMCHECK` builds: watch guest functions and guest memory writes.
   - `RT32_TRACE_GL`, `RT32_TRACE_FMOD`, `RT32_TRACE_FILES`: subsystem traces.
+  - `RT32_HUD=1` or F12: overlay with frame rate, frame time, GPU time and memory. F9 switches MetalFX upscaling
+    on and off (`RT32_NO_METALFX=1` disables it).
+  - `[frame]`, `[hitch+]`, `[slowcall]`, `[shader]` log lines: where frame time goes, with GPU time from a timer
+    query. `RT32_PACE=display` paces frames from the display (variable refresh), `RT32_WARM=1` draws once with
+    each shader program when it is validated.
 
 ## Diagnostics (Windows x86-64)
 

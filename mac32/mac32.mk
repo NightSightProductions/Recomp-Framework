@@ -70,8 +70,12 @@ $(BUILD)/game/%.o: %.c $(M32_HDR)
 $(BUILD)/libgame32.a: $(GEN_OBJ)
 	rm -f $@; ar rcs $@ $^
 
+# Metal + MetalFX + IOSurface + QuartzCore were added for the MetalFX upscaler in runtime/host.m
+# (IOSurface = memory shared between OpenGL and Metal; QuartzCore = CAMetalLayer). MetalFX exists on macOS 13+ only;
+# with MACOS_MIN below 13 the linker weak-links it and host.m checks @available before using it.
 FRAMEWORKS = -framework CoreFoundation -framework ApplicationServices -framework Cocoa -framework Carbon -framework OpenGL \
-             -framework AudioToolbox -framework CoreAudio
+             -framework AudioToolbox -framework CoreAudio \
+             -framework Metal -framework MetalFX -framework IOSurface -framework QuartzCore
 $(BUILD)/$(APP_NAME): $(BUILD)/libgame32.a $(RT_OBJ) $(GAME_OBJ)
 	$(CC) $(CFLAGS) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/libgame32.a -lz -lc++ $(FFMPEG_LIBS) $(FRAMEWORKS) -o $@
 app: $(BUILD)/$(APP_NAME)
