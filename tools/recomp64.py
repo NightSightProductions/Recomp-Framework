@@ -432,6 +432,7 @@ class FuncGen:
         f.append("void F_%x(CPU *c) {" % self.addr)
         f.append("    uint64_t cf = 0, zf = 0, sf = 0, of = 0, pr = 0; (void)cf; (void)zf; (void)sf; (void)of; (void)pr;")
         f.append("    c->fn = 0x%xull;" % self.addr)
+        if self.addr in getattr(self.tr, "eh_sites", ()): f.append("    rt_eh_site(c);")
         last = None
         for i in self.ins:
             if last is not None and not self.ends_block(last) and i.address != last.address + last.size:
@@ -1198,6 +1199,8 @@ class FuncGen:
             e("{ XMM s_ = %s, d_ = %s, m_ = C.xmm[0]; d_.%s = VSEL(m_.%s >> %d, s_.%s, d_.%s); %s = d_; }" % (src, D, sv, sv, sh, sv, sv, D)); return True
         if m == "ptest" and src:
             e("{ XMM s_ = %s, d_ = %s; zf = ((d_.q[0] & s_.q[0]) | (d_.q[1] & s_.q[1])) == 0; cf = ((~d_.q[0] & s_.q[0]) | (~d_.q[1] & s_.q[1])) == 0; of = sf = 0; }" % (src, D)); return True
+        if m == "phminposuw" and src:   # SSE4.1: the smallest unsigned word and its index (the first, on a tie)
+            e("{ XMM s_ = %s, r_ = {0}; int k_ = 0; for (int k = 1; k < 8; k++) if (s_.w[k] < s_.w[k_]) k_ = k; r_.w[0] = s_.w[k_]; r_.w[1] = (uint16_t)k_; %s = r_; }" % (src, D)); return True
         if m == "palignr" and imm is not None:
             e("{ XMM s_ = %s, d_ = %s, r_ = {0}; uint8_t t[32]; memcpy(t, &s_, 16); memcpy(t + 16, &d_, 16); for (int k = 0; k < 16; k++) r_.b[k] = k + %d < 32 ? t[k + %d] : 0; %s = r_; }" % (S_(ops[1]), D, imm, imm, D)); return True
         return False
@@ -1317,6 +1320,31 @@ class Translator:
             elif code[i] == 0xFF and code[i + 1] == 0x15:   # call qword ptr [rip+disp32]
                 if pe.text_lo + i + 6 + struct.unpack_from("<i", code, i + 2)[0] in sj_slots: starts.add(pe.text_lo + i + 6); self.setjmp_conts.add(pe.text_lo + i + 6)
         if self.setjmp_conts: print("setjmp continuations: %d" % len(self.setjmp_conts))
+        # C++ catch: a function with a __CxxFrameHandler3 try block keeps a host jmp_buf for its frame (rt_eh_site),
+        # and the address each catch block (a funclet) returns, where the function goes on after the catch, becomes a
+        # function of its own that the runtime enters there (runtime/cxxeh.c)
+        self.eh_sites = set(); self.eh_conts = set()
+        def u32s(fmt, a): return struct.unpack(fmt, pe.read(a, struct.calcsize(fmt)))
+        for s, (h, hd) in pe.handler.items():
+            try:
+                fi = pe.base + u32s("<I", hd)[0]
+                magic, maxst, umap, ntry, tmap = u32s("<IiIII", fi)
+            except KeyError: continue
+            if not (0x19930520 <= magic <= 0x19930522) or not (0 < ntry < 100000): continue
+            self.eh_sites.add(s)
+            for t in range(ntry):
+                lo, hi, ch, nc, hs = u32s("<iiiII", pe.base + tmap + 20 * t)
+                for k in range(min(nc, 1000)):
+                    adj, pt, disp, haddr, dframe = u32s("<IIiII", pe.base + hs + 20 * k)
+                    fa = pe.base + haddr
+                    if fa not in pe.pdata: continue
+                    fe = pe.pdata[fa][0]
+                    for (a, sz, mn, opst) in lite.disasm_lite(code[fa - pe.text_lo:fe - pe.text_lo], fa):
+                        if mn == "lea" and opst.startswith("rax,"):
+                            t2 = lea_target(a, sz, opst)
+                            if t2 is not None and pe.is_code(t2) and not (fa <= t2 < fe):
+                                starts.add(t2); self.eh_conts.add(t2)
+        if self.eh_sites: print("catching functions: %d, catch continuations: %d" % (len(self.eh_sites), len(self.eh_conts)))
         for slot in pe.relocs:
             try: v = struct.unpack("<Q", pe.read(slot, 8))[0]
             except KeyError: continue
@@ -1402,14 +1430,14 @@ class Translator:
         # a setjmp continuation is entered mid-function and branches anywhere in it (loops back to before itself):
         # give it the whole range of the function that contains it
         # (the continuation's own start must not cut the containing function's region short either)
-        conts = getattr(self, "setjmp_conts", set())
+        conts = getattr(self, "setjmp_conts", set()) | getattr(self, "eh_conts", set())
         if conts:
-            prim = sorted(x for x in pe.pdata if x not in pe.chain_parent)
+            allp = sorted(pe.pdata)
             for cont in conts:
-                k = bisect.bisect_right(prim, cont) - 1
-                if k < 0: continue
-                s0 = prim[k]
-                if not (s0 < cont < pe.pdata[s0][0]): continue
+                k = bisect.bisect_right(allp, cont) - 1
+                if k < 0 or not (allp[k] <= cont < pe.pdata[allp[k]][0]): continue
+                s0 = pe.chain_parent.get(allp[k], allp[k])   # a catch continuation may sit in a cold part
+                if s0 == cont: continue
                 full = [(s0, pe.pdata[s0][0])] + parts.get(s0, [])
                 self.regions[s0] = full
                 self.regions[cont] = list(full)
@@ -1536,6 +1564,10 @@ def main():
         # registers saved here and jumps back, and the site then returns its value in rax
         f.write("#include <setjmp.h>\njmp_buf *rt_sj_prepare(CPU *c);\nvoid rt_sj_resumed(CPU *c);\n"
                 "#define rt_setjmp_site(c) do { if (setjmp(*rt_sj_prepare(c))) rt_sj_resumed(c); } while (0)\n")
+        # catch sites: a function with a try block, entered again here when one of its catch blocks has run; it then
+        # finishes in the catch continuation, which returns for it (runtime/cxxeh.c)
+        f.write("jmp_buf *rt_eh_prepare(CPU *c);\nvoid rt_eh_resumed(CPU *c);\n"
+                "#define rt_eh_site(c) do { if (_setjmp(*rt_eh_prepare(c))) { rt_eh_resumed(c); return; } } while (0)\n")
         f.write("".join("void F_%x(CPU *c);\n" % a for a in sorted(TR.funcs_set)))
         f.write("".join("void I_%s(CPU *c);\n" % cname(n) for n in allimp))
     if module:

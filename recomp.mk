@@ -76,7 +76,8 @@ $(BUILD)/libgame.a: $(GEN_OBJ)
 
 # ---- runtime ----
 FW_RT_C = rt.c teb.c kernel32.c handles.c files.c vulkan.c display.c window.c bcrypt.c input.c xaudio2.c pdh.c \
-          system.c dinput.c sockets.c wasapi.c fiber.c user32.c steam.c native.c spvfix.c setjmp.c xreverb.c
+          system.c dinput.c sockets.c wasapi.c fiber.c user32.c steam.c native.c spvfix.c setjmp.c xreverb.c \
+          ucrt.c ucrt_stdio.c vcruntime.c msvcp.c cxxeh.c
 FW_RT_M = cocoa.m winhttp.m gamepad.m gpucapture.m opengl.m
 RT_OBJ  = $(patsubst %.c,$(BUILD)/fw/%.o,$(FW_RT_C)) $(patsubst %.m,$(BUILD)/fw/%.o,$(FW_RT_M))
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
