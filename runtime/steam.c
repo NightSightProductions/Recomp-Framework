@@ -20,10 +20,10 @@
 #define NSLOTS 96
 // ISteamRemoteStorage: every method answers 0 (cloud disabled, no files), so saves stay on local disk
 enum { IF_USER, IF_FRIENDS, IF_UTILS, IF_APPS, IF_USERSTATS, IF_MATCHMAKING, IF_NETWORKING, IF_CONTROLLER, IF_CLIENT,
-       IF_REMOTESTORAGE, NIF };
+       IF_REMOTESTORAGE, IF_GENERIC, NIF };
 static const char *if_names[NIF] = { "ISteamUser", "ISteamFriends", "ISteamUtils", "ISteamApps", "ISteamUserStats",
                                      "ISteamMatchmaking", "ISteamNetworking", "ISteamController", "ISteamClient",
-                                     "ISteamRemoteStorage" };
+                                     "ISteamRemoteStorage", "ISteamGeneric" };
 static uint64_t objs[NIF];
 #include "game.h"
 #define app_id (rt_game.steam_app_id)
@@ -870,3 +870,79 @@ void I_steam_api64_dll_SteamNetworking(CPU *c) { RET(make_iface(IF_NETWORKING));
 void I_steam_api64_dll_SteamController(CPU *c) { RET(make_iface(IF_CONTROLLER)); }
 void I_steam_api64_dll_SteamClient(CPU *c) { RET(make_iface(IF_CLIENT)); }
 void I_steam_api64_dll_SteamRemoteStorage(CPU *c) { RET(make_iface(IF_REMOTESTORAGE)); }
+
+// ---------------- Steamworks SDK 1.37+ (CSteamAPIContext) ----------------
+// Newer SDKs (Wolfenstein II: 1.41) don't import SteamUser(), SteamFriends()...: the game's accessors go through a
+// CSteamAPIContext, filled by SteamInternal_ContextInit, which runs the game's own init function. That calls
+// SteamAPI_GetHSteamUser/Pipe, SteamInternal_CreateInterface("SteamClient0xx") and then
+// ISteamClient::GetISteam*(hUser, hPipe, "<version>") for each interface. Every one of those getters takes the
+// version string last, so they are recognized by it rather than by slot number (which shifts between versions).
+// Interfaces modelled here get their usual object; any other (HTTP, UGC, screenshots...) a generic one whose
+// slots all answer 0.
+static int iface_for_version(const char *v) {
+    static const struct { const char *prefix; int i; } map[] = {
+        { "SteamUser0", IF_USER }, { "SteamFriends0", IF_FRIENDS }, { "SteamUtils0", IF_UTILS },
+        { "STEAMAPPS_INTERFACE_VERSION", IF_APPS }, { "STEAMUSERSTATS_INTERFACE_VERSION", IF_USERSTATS },
+        { "SteamMatchMaking0", IF_MATCHMAKING }, { "SteamNetworking0", IF_NETWORKING },
+        { "SteamController0", IF_CONTROLLER }, { "SteamClient0", IF_CLIENT },
+        { "STEAMREMOTESTORAGE_INTERFACE_VERSION", IF_REMOTESTORAGE },
+    };
+    for (size_t k = 0; k < sizeof map / sizeof *map; k++) if (!strncmp(v, map[k].prefix, strlen(map[k].prefix))) return map[k].i;
+    return IF_GENERIC;
+}
+// a guest pointer to an interface version string, or NULL (only pointers into the exe's image are read)
+static const char *version_string(uint64_t p) {
+    if (p < gimage_base || p + 64 > gimage_base + gimage_size) return NULL;
+    const char *v = PTR(p);
+    return !strncmp(v, "Steam", 5) || !strncmp(v, "STEAM", 5) ? v : NULL;
+}
+static uint64_t iface_for(const char *v) {
+    int i = iface_for_version(v);
+    static int logged[NIF];
+    if (i == IF_GENERIC || !logged[i]++) rt_log("[steam] interface %s -> %s\n", v, if_names[i]);
+    return make_iface(i);
+}
+
+#define HSTEAMUSER 1
+void I_steam_api64_dll_SteamAPI_GetHSteamUser(CPU *c) { RET(HSTEAMUSER); }
+void I_steam_api64_dll_SteamAPI_GetHSteamPipe(CPU *c) { RET(S.online && S.pipe ? (uint32_t)S.pipe : 1); }
+static void client_slots(void);
+void I_steam_api64_dll_SteamInternal_CreateInterface(CPU *c) {
+    client_slots();
+    const char *v = version_string(A0);
+    RET(v ? iface_for(v) : 0);
+}
+// SteamInternal_ContextInit(ContextInitData *): { void (*pFn)(CSteamAPIContext *) +0; uintp counter +8;
+// CSteamAPIContext ctx +16 }. The SDK re-runs pFn whenever its global counter (bumped by SteamAPI_Init and
+// Shutdown) changed since; here the interfaces never change, so it runs once per context.
+void I_steam_api64_dll_SteamInternal_ContextInit(CPU *c) {
+    uint64_t d = A0;
+    client_slots();
+    if (rd64(d + 8) != 1) {
+        wr64(d + 8, 1);
+        uint64_t ctx = d + 16;
+        guest_call(c, rd64(d), 1, &ctx);
+    }
+    RET(d + 16);
+}
+
+// ISteamClient: 0 CreateSteamPipe, 1 BReleaseSteamPipe, 2 ConnectToGlobalUser, 3 CreateLocalUser, 4 ReleaseUser;
+// from 5 on, every getter that has a version string argument returns that interface. Installed by the SDK 1.37+
+// entry points above, so a game on the older accessors (SteamUser()...) keeps the default of 0 for every slot.
+static void cl_pipe(CPU *c, int i, int s) { RET(S.online && S.pipe ? (uint32_t)S.pipe : 1); }
+static void cl_user(CPU *c, int i, int s) { RET(HSTEAMUSER); }
+static void cl_getter(CPU *c, int i, int s) {
+    const char *v = version_string(A3); if (!v) v = version_string(A2); if (!v) v = version_string(A1);
+    if (!v) {
+        static uint8_t seen[NSLOTS];
+        if (!seen[s]++) rt_log("[steam] ISteamClient::slot %d (no interface version) -> 0\n", s);
+        RET(0); return;
+    }
+    RET(iface_for(v));
+}
+static void client_slots(void) {
+    if (impl[IF_CLIENT][0]) return;
+    impl[IF_CLIENT][0] = cl_pipe; impl[IF_CLIENT][1] = ret_true; impl[IF_CLIENT][2] = cl_user;
+    impl[IF_CLIENT][3] = cl_user; impl[IF_CLIENT][4] = ret_true;
+    for (int s = 5; s < NSLOTS; s++) impl[IF_CLIENT][s] = cl_getter;
+}
