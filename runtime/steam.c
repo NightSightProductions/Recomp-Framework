@@ -912,6 +912,14 @@ void I_steam_api64_dll_SteamInternal_CreateInterface(CPU *c) {
     const char *v = version_string(A0);
     RET(v ? iface_for(v) : 0);
 }
+// SDK 1.42+: SteamInternal_FindOrCreateUserInterface(hSteamUser, version) and
+// SteamInternal_FindOrCreateGameServerInterface(hSteamUser, version) hand out an interface by its version string
+void I_steam_api64_dll_SteamInternal_FindOrCreateUserInterface(CPU *c) {
+    client_slots();
+    const char *v = version_string(A1);
+    RET(v ? iface_for(v) : 0);
+}
+void I_steam_api64_dll_SteamInternal_FindOrCreateGameServerInterface(CPU *c) { RET(0); }
 // SteamInternal_ContextInit(ContextInitData *): { void (*pFn)(CSteamAPIContext *) +0; uintp counter +8;
 // CSteamAPIContext ctx +16 }. The SDK re-runs pFn whenever its global counter (bumped by SteamAPI_Init and
 // Shutdown) changed since; here the interfaces never change, so it runs once per context.
