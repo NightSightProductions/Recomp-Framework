@@ -59,6 +59,12 @@ void I_kernel32_dll_DuplicateHandle(CPU *c) {
     // (srcProc, src, dstProc, *dst, access, inherit, options)
     uint64_t src = A1;
     if (src == ~1ull) src = thread_self_handle();
+    // the standard handles (GetStdHandle's 'STD0'..'STD2' values) are no objects: the duplicate is the same value.
+    // The UCRT's _dup (stdout redirection) duplicates them, and its failure path indexes the fd table with -1.
+    if ((src >> 32) >= 0x53544430u && (src >> 32) <= 0x53544432u && !(uint32_t)src) {
+        if (A3) wr64(A3, src);
+        RET(1); return;
+    }
     pthread_mutex_lock(&hmu);
     HObj *o = h_get(src);
     if (o) o->refs++;

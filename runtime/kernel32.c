@@ -838,7 +838,7 @@ static void verify_version(CPU *c, uint32_t sp_off);
 void I_kernel32_dll_VerifyVersionInfoA(CPU *c) { verify_version(c, 148); }
 void I_kernel32_dll_VerifyVersionInfoW(CPU *c) { verify_version(c, 276); }
 static void verify_version(CPU *c, uint32_t sp_off) {
-    uint64_t vi = A0, mask = AN(2); uint32_t type = (uint32_t)A1;
+    uint64_t vi = A0, mask = A2; uint32_t type = (uint32_t)A1;   // (vi, typeMask, conditionMask): all in registers
     // major.minor.servicepack compare together when they're all asked for, as Windows does
     uint64_t have = ((uint64_t)10 << 32), want = ((uint64_t)rd32(vi + 4) << 32) | ((uint64_t)rd32(vi + 8) << 16) | rd16(vi + sp_off);
     int ok = 1;
@@ -872,7 +872,7 @@ static void mapping_close(HObj *o) {
     o->data = NULL;
 }
 void I_kernel32_dll_CreateFileMappingA(CPU *c) {
-    uint64_t file = A0, size = ((uint64_t)(uint32_t)AN(3) << 32) | (uint32_t)AN(4), pname = AN(5);
+    uint64_t file = A0, size = ((uint64_t)(uint32_t)A3 << 32) | (uint32_t)AN(4), pname = AN(5);
     const char *name = pname ? (const char *)PTR(pname) : NULL;
     if (name && *name) {   // the same name again: the same mapping
         pthread_mutex_lock(&map_mu);
@@ -965,7 +965,7 @@ void I_psapi_dll_EnumProcessModules(CPU *c) {
 void I_psapi_dll_GetModuleBaseNameA(CPU *c) {
     char p[512]; module_path(A1 ? A1 : gimage_base, p, sizeof p);
     const char *b = strrchr(p, '\\'); b = b ? b + 1 : p;
-    uint32_t n = (uint32_t)AN(3); if (!n || !A2) { RET(0); return; }
+    uint32_t n = (uint32_t)A3; if (!n || !A2) { RET(0); return; }
     size_t l = strlen(b); if (l >= n) l = n - 1;
     memcpy(PTR(A2), b, l); wr8(A2 + l, 0);
     RET(l);
@@ -973,3 +973,29 @@ void I_psapi_dll_GetModuleBaseNameA(CPU *c) {
 
 // GetProfileIntA(app, key, default): there is no win.ini, so the default
 void I_kernel32_dll_GetProfileIntA(CPU *c) { RET((uint32_t)A2); }
+
+// GetThreadTimes(thread, *creation, *exit, *kernel, *user): FILETIMEs in 100 ns units. The calling thread's own
+// CPU times come from Mach (GetCurrentThread's pseudo handle, the usual caller); other threads report zero times.
+#include <mach/mach.h>
+void I_kernel32_dll_GetThreadTimes(CPU *c) {
+    uint64_t kern = 0, user = 0;
+    if (A0 == ~1ull) {
+        thread_basic_info_data_t info; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+        mach_port_t self = mach_thread_self();
+        if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&info, &n) == KERN_SUCCESS) {
+            user = (uint64_t)info.user_time.seconds * 10000000ull + (uint64_t)info.user_time.microseconds * 10ull;
+            kern = (uint64_t)info.system_time.seconds * 10000000ull + (uint64_t)info.system_time.microseconds * 10ull;
+        }
+        mach_port_deallocate(mach_task_self(), self);
+    }
+    if (A1) wr64(A1, 0);
+    if (A2) wr64(A2, 0);
+    if (A3) wr64(A3, kern);
+    if (AN(4)) wr64(AN(4), user);
+    RET(1);
+}
+
+// Add/RemoveVectoredExceptionHandler: guest exceptions are never dispatched to handlers here (a fault is reported by
+// the runtime's own crash handler), so registration only hands back a non-NULL cookie, as the caller checks for one.
+void I_kernel32_dll_AddVectoredExceptionHandler(CPU *c) { static uint64_t cookie; RET(G(&cookie)); }
+void I_kernel32_dll_RemoveVectoredExceptionHandler(CPU *c) { RET(1); }

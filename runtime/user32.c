@@ -118,7 +118,7 @@ void I_user32_dll_DialogBoxParamA(CPU *c) {
 }
 void I_user32_dll_DialogBoxParamW(CPU *c) { I_user32_dll_DialogBoxParamA(c); }
 void I_user32_dll_EndDialog(CPU *c) { RET(1); }
-void I_user32_dll_GetDlgItemTextA(CPU *c) { if (A2 && (uint32_t)AN(3)) wr8(A2, 0); set_last_error(1421); RET(0); }   // ERROR_CONTROL_ID_NOT_FOUND
+void I_user32_dll_GetDlgItemTextA(CPU *c) { if (A2 && (uint32_t)A3) wr8(A2, 0); set_last_error(1421); RET(0); }   // ERROR_CONTROL_ID_NOT_FOUND
 void I_user32_dll_SetDlgItemTextA(CPU *c) { set_last_error(1421); RET(0); }
 
 // ---------------- GDI: objects, DIB sections, pixels ----------------

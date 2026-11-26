@@ -324,6 +324,42 @@ static void rw_file(CPU *c, int wr) {
 void I_kernel32_dll_ReadFile(CPU *c) { rw_file(c, 0); }
 void I_kernel32_dll_WriteFile(CPU *c) { rw_file(c, 1); }
 
+// ReadFileScatter(h, FILE_SEGMENT_ELEMENT segs[], n, reserved, ovl): reads n bytes at the OVERLAPPED's offset into
+// one system page (0x1000, as GetSystemInfo reports) per segment, each segment a 64-bit buffer pointer. Windows
+// requires an overlapped, unbuffered handle, and such a read always goes pending: callers (id Tech's
+// virtual-texture page streamer) only handle FALSE + ERROR_IO_PENDING followed by GetOverlappedResult. The function
+// has no bytes-read output, so on a TRUE return the streamer sees 0 bytes and zero-fills the pages (black textures).
+// So the read is done here at once, but reported as pending; the OVERLAPPED already holds the result.
+#include <sys/uio.h>
+void I_kernel32_dll_ReadFileScatter(CPU *c) {
+    uint64_t segs = A1, ovl = AN(4); uint32_t n = (uint32_t)A2;
+    const size_t page = 0x1000;
+    HObj *o; int fd = fd_of(A0, &o);
+    if (fd < 0 || !ovl || !segs) { set_last_error(87); RET(0); return; }   // ERROR_INVALID_PARAMETER
+    int64_t off = (int64_t)((uint64_t)rd32(ovl + 16) | (uint64_t)rd32(ovl + 20) << 32);
+    size_t total = 0, npages = (n + page - 1) / page;
+    struct iovec iov[256];
+    while (total < n) {
+        int k = 0; size_t want = 0;
+        for (size_t p = total / page; p < npages && k < 256; p++, k++) {
+            iov[k].iov_base = PTR(rd64(segs + 8 * p));
+            iov[k].iov_len = (p + 1) * page <= n ? page : n - p * page;
+            want += iov[k].iov_len;
+        }
+        ssize_t r = preadv(fd, iov, k, off + (int64_t)total);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            ovl_done(ovl, 0xC0000001u, total); set_last_error(errno_err(errno, NULL)); RET(0); return;
+        }
+        total += (size_t)r;
+        if ((size_t)r < want) break;   // end of file
+    }
+    if (!total && n) ovl_done(ovl, 0xC0000011u, 0);   // STATUS_END_OF_FILE, reported by GetOverlappedResult
+    else ovl_done(ovl, 0, total);
+    set_last_error(997);   // ERROR_IO_PENDING
+    RET(0);
+}
+
 // GetOverlappedResult(h, ovl, *bytes, wait): everything completed synchronously
 void I_kernel32_dll_GetOverlappedResult(CPU *c) {
     uint64_t ovl = A1; uint32_t st = (uint32_t)rd64(ovl);
@@ -375,6 +411,22 @@ void I_kernel32_dll_GetFileTime(CPU *c) {
     if (A3) wr64(A3, ts_ft(st.st_mtimespec));
     RET(1);
 }
+// GetFileInformationByHandle(h, BY_HANDLE_FILE_INFORMATION*): attributes +0, creation +4, access +12, write +20,
+// volume serial +28, size high +32 / low +36, links +40, file index high +44 / low +48. The UCRT's fstat uses it.
+void I_kernel32_dll_GetFileInformationByHandle(CPU *c) {
+    HObj *o; int fd = fd_of(A0, &o); struct stat st;
+    if (fd < 0 || fstat(fd, &st)) { set_last_error(ERR_INVALID_HANDLE); RET(0); return; }
+    uint64_t b = A1;
+    wr32(b, attrs_of(&st, o && o->name ? o->name : ""));
+    wr64(b + 4, ts_ft(st.st_birthtimespec)); wr64(b + 12, ts_ft(st.st_atimespec)); wr64(b + 20, ts_ft(st.st_mtimespec));
+    wr32(b + 28, (uint32_t)st.st_dev);
+    wr32(b + 32, (uint32_t)((uint64_t)st.st_size >> 32)); wr32(b + 36, (uint32_t)st.st_size);
+    wr32(b + 40, (uint32_t)st.st_nlink);
+    wr32(b + 44, (uint32_t)((uint64_t)st.st_ino >> 32)); wr32(b + 48, (uint32_t)st.st_ino);
+    RET(1);
+}
+// CancelIo(h): overlapped I/O here completes inside the call that starts it, so nothing is ever outstanding
+void I_kernel32_dll_CancelIo(CPU *c) { RET(1); }
 void I_kernel32_dll_SetEndOfFile(CPU *c) {
     int fd = fd_of(A0, NULL);
     if (fd < 0) { RET(0); return; }
@@ -833,4 +885,17 @@ void I_kernel32_dll_WriteConsoleW(CPU *c) {
     free(u); free(tmp);
     if (A3) wr32(A3, n);
     RET(1);
+}
+
+// GetShortPathName(long, short, cch): with 8.3 names off (the default on current Windows), the short form is the path
+// itself. Returns the length copied, or the buffer size needed (with the NUL) when cch is too small.
+void I_kernel32_dll_GetShortPathNameW(CPU *c) {
+    const uint16_t *src = PTR(A0); size_t n = w16len(src);
+    if (A2 > n && A1) { memmove(PTR(A1), src, (n + 1) * 2); RET(n); return; }
+    RET(n + 1);
+}
+void I_kernel32_dll_GetShortPathNameA(CPU *c) {
+    const char *src = PTR(A0); size_t n = strlen(src);
+    if (A2 > n && A1) { memmove(PTR(A1), src, n + 1); RET(n); return; }
+    RET(n + 1);
 }

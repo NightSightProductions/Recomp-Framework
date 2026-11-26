@@ -43,6 +43,12 @@ static int put_name(uint64_t buf, uint64_t psize, const char *s, int count_nul) 
 }
 void I_advapi32_dll_GetUserNameA(CPU *c) { RET(put_name(A0, A1, "Player", 1)); }
 void I_kernel32_dll_GetComputerNameA(CPU *c) { RET(put_name(A0, A1, rt_game.computer_name ? rt_game.computer_name : "MAC", 0)); }
+// GetComputerNameExA(format, buf, *size): the domain forms (DnsDomain 2, PhysicalDnsDomain 6) are empty (no domain);
+// every host-name form is the computer name
+void I_kernel32_dll_GetComputerNameExA(CPU *c) {
+    uint32_t fmt = (uint32_t)A0;
+    RET(put_name(A1, A2, fmt == 2 || fmt == 6 ? "" : rt_game.computer_name ? rt_game.computer_name : "MAC", 0));
+}
 
 // ---------------- advapi32: an empty registry ----------------
 #define ERROR_FILE_NOT_FOUND 2
