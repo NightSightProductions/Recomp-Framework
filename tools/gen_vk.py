@@ -22,6 +22,11 @@ MANUAL = {
     "vkEnumerateInstanceExtensionProperties",
     "vkCreateDebugReportCallbackEXT", "vkDestroyDebugReportCallbackEXT",
     "vkCreateDebugUtilsMessengerEXT", "vkDestroyDebugUtilsMessengerEXT",
+    "vkGetPhysicalDeviceMemoryProperties", "vkGetPhysicalDeviceMemoryProperties2", "vkGetPhysicalDeviceMemoryProperties2KHR",
+    "vkAllocateMemory", "vkGetBufferMemoryRequirements", "vkGetImageMemoryRequirements",
+    "vkGetBufferMemoryRequirements2", "vkGetImageMemoryRequirements2", "vkGetBufferMemoryRequirements2KHR",
+    "vkGetImageMemoryRequirements2KHR", "vkGetDeviceBufferMemoryRequirements", "vkGetDeviceImageMemoryRequirements",
+    "vkGetDeviceBufferMemoryRequirementsKHR", "vkGetDeviceImageMemoryRequirementsKHR",
 }
 RET64 = {"uint64_t", "VkDeviceAddress", "VkDeviceSize"}
 RET32 = {"VkResult", "uint32_t", "VkBool32", "int32_t"}

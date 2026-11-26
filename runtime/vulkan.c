@@ -252,6 +252,105 @@ void I_vulkan_1_dll_vkCreateDevice(CPU *c) {
     RET((uint32_t)r);
 }
 
+// ---------------- memory types ----------------
+// Apple GPUs share memory with the CPU, so the driver offers a single memory type with every property set
+// (device local, host visible, coherent, cached). An allocator that rules properties out ("device local but not
+// host visible" for GPU-only blocks) then finds no type at all. The game sees each such type followed by
+// aliases with properties removed; they all allocate from the real type. The real types keep their indices, so a
+// game that takes the first type with the properties it needs gets the same type as without the aliases.
+static VkPhysicalDeviceMemoryProperties mt_view;   // what the game sees
+static uint8_t mt_host[VK_MAX_MEMORY_TYPES];       // guest type -> driver type
+static uint32_t mt_alias[VK_MAX_MEMORY_TYPES];     // driver type -> mask of guest types
+static int mt_ready;
+static pthread_mutex_t mt_mu = PTHREAD_MUTEX_INITIALIZER;
+static PFN_vkGetPhysicalDeviceMemoryProperties p_vkGetPhysicalDeviceMemoryProperties;
+static void mt_build(VkPhysicalDevice pd) {
+    if (!p_vkGetPhysicalDeviceMemoryProperties)
+        p_vkGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)vk_proc("vkGetPhysicalDeviceMemoryProperties");
+    pthread_mutex_lock(&mt_mu);
+    if (mt_ready || !pd || !p_vkGetPhysicalDeviceMemoryProperties) { pthread_mutex_unlock(&mt_mu); return; }
+    VkPhysicalDeviceMemoryProperties hp; p_vkGetPhysicalDeviceMemoryProperties(pd, &hp);
+    mt_view = hp;
+    uint32_t n = hp.memoryTypeCount;
+    for (uint32_t i = 0; i < n; i++) { mt_host[i] = (uint8_t)i; mt_alias[i] = 1u << i; }
+    const VkMemoryPropertyFlags keep = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const VkMemoryPropertyFlags drop[] = {
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT };
+    for (uint32_t i = 0; i < hp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = hp.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        for (size_t d = 0; d < sizeof drop / sizeof *drop; d++) {
+            VkMemoryPropertyFlags g = f & ~drop[d];
+            if (!(g & keep) || g == f || n == VK_MAX_MEMORY_TYPES) continue;
+            int dup = 0;
+            for (uint32_t k = 0; k < n; k++) dup |= mt_view.memoryTypes[k].propertyFlags == g && mt_host[k] == i;
+            if (dup) continue;
+            mt_view.memoryTypes[n] = (VkMemoryType){ g, hp.memoryTypes[i].heapIndex };
+            mt_host[n] = (uint8_t)i; mt_alias[i] |= 1u << n; n++;
+        }
+    }
+    mt_view.memoryTypeCount = n;
+    if (n != hp.memoryTypeCount) {
+        char s[512]; int o = 0;
+        for (uint32_t k = 0; k < n && o < (int)sizeof s - 32; k++)
+            o += snprintf(s + o, sizeof s - o, " %u:0x%x%s", k, mt_view.memoryTypes[k].propertyFlags, k < hp.memoryTypeCount ? "" : "*");
+        rt_log("[vulkan] memory types:%s (* aliases)\n", s);
+    }
+    mt_ready = 1;
+    pthread_mutex_unlock(&mt_mu);
+}
+static uint32_t mt_bits(uint32_t host_bits) {
+    if (!mt_ready) mt_build(g_pd);
+    if (!mt_ready) return host_bits;
+    uint32_t g = 0;
+    for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++) if (host_bits >> i & 1) g |= mt_alias[i];
+    return g;
+}
+void I_vulkan_1_dll_vkGetPhysicalDeviceMemoryProperties(CPU *c) {
+    VK_LOAD(vkGetPhysicalDeviceMemoryProperties, );
+    mt_build((VkPhysicalDevice)PTR(A0));
+    if (mt_ready) *(VkPhysicalDeviceMemoryProperties *)PTR(A1) = mt_view;
+    else p_vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)PTR(A0), PTR(A1));
+}
+static void mt_props2(CPU *c, const char *name) {
+    PFN_vkGetPhysicalDeviceMemoryProperties2 f = (PFN_vkGetPhysicalDeviceMemoryProperties2)vk_proc(name);
+    if (!f) { vk_missing(name); return; }
+    VkPhysicalDeviceMemoryProperties2 *p = PTR(A1);
+    f((VkPhysicalDevice)PTR(A0), p);   // extension structs (the memory budget) describe heaps, which are unchanged
+    mt_build((VkPhysicalDevice)PTR(A0));
+    if (mt_ready) p->memoryProperties = mt_view;
+}
+void I_vulkan_1_dll_vkGetPhysicalDeviceMemoryProperties2(CPU *c) { mt_props2(c, "vkGetPhysicalDeviceMemoryProperties2"); }
+void I_vulkan_1_dll_vkGetPhysicalDeviceMemoryProperties2KHR(CPU *c) { mt_props2(c, "vkGetPhysicalDeviceMemoryProperties2KHR"); }
+// vkAllocateMemory(device, VkMemoryAllocateInfo*, alloc, VkDeviceMemory*): the game's type becomes the driver's
+static PFN_vkAllocateMemory p_vkAllocateMemory;
+void I_vulkan_1_dll_vkAllocateMemory(CPU *c) {
+    VK_LOAD(vkAllocateMemory, RET((uint32_t)VK_ERROR_INITIALIZATION_FAILED));
+    VkMemoryAllocateInfo ai = *(const VkMemoryAllocateInfo *)PTR(A1);
+    if (!mt_ready) mt_build(g_pd);
+    if (mt_ready && ai.memoryTypeIndex < mt_view.memoryTypeCount) ai.memoryTypeIndex = mt_host[ai.memoryTypeIndex];
+    VkResult r = p_vkAllocateMemory((VkDevice)PTR(A0), &ai, NULL, PTR(A3));
+    if (r < 0) vk_failed("vkAllocateMemory", r);
+    RET((uint32_t)r);
+}
+// The memory requirements of buffers and images: memoryTypeBits names the driver's types, the game's include aliases
+#define MT_REQ(name, ty, field) static PFN_##name p_##name; \
+    void I_vulkan_1_dll_##name(CPU *c) { VK_LOAD(name, ); ty *r_ = PTR(A2); \
+        p_##name((VkDevice)PTR(A0), PTR(A1), r_); r_->field = mt_bits(r_->field); }
+MT_REQ(vkGetBufferMemoryRequirements, VkMemoryRequirements, memoryTypeBits)
+MT_REQ(vkGetImageMemoryRequirements, VkMemoryRequirements, memoryTypeBits)
+MT_REQ(vkGetBufferMemoryRequirements2, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetImageMemoryRequirements2, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetBufferMemoryRequirements2KHR, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetImageMemoryRequirements2KHR, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetDeviceBufferMemoryRequirements, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetDeviceImageMemoryRequirements, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetDeviceBufferMemoryRequirementsKHR, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+MT_REQ(vkGetDeviceImageMemoryRequirementsKHR, VkMemoryRequirements2, memoryRequirements.memoryTypeBits)
+
 // ---------------- win32 surface -> Metal surface ----------------
 uint64_t rt_last_surface_hwnd;
 // The window system provides the CAMetalLayer behind a guest HWND; until it exists, surfaces fail cleanly.
