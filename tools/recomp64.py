@@ -773,9 +773,17 @@ class FuncGen:
     def atomic(self, i, m, ops):
         e = self.e
         if not m.startswith("lock "):
-            if m in ("cmpxchg", "xadd"): pass
+            if m in ("cmpxchg", "xadd", "cmpxchg16b"): pass
             else: return False
         base = m[5:] if m.startswith("lock ") else m
+        if base == "cmpxchg16b" and ops[0].type == X.X86_OP_MEM:
+            # compare rdx:rax with m128: equal -> ZF=1, m128 = rcx:rbx; else ZF=0, rdx:rax = m128 (other flags kept).
+            # A 16-byte compare-exchange is CASP on arm64 (LSE); the operand is 16-byte aligned, as x86 requires.
+            p = "(unsigned __int128 *)(uintptr_t)%s" % self.ea(ops[0])
+            e("{ unsigned __int128 exp = ((unsigned __int128)C.rdx << 64) | C.rax, des = ((unsigned __int128)C.rcx << 64) | C.rbx; "
+              "zf = __atomic_compare_exchange_n(%s, &exp, des, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); "
+              "if (!zf) { C.rax = (uint64_t)exp; C.rdx = (uint64_t)(exp >> 64); } }" % p)
+            return True
         d = ops[0]; n = d.size; T = U[n]
         if d.type != X.X86_OP_MEM:
             if base == "xadd":
@@ -1141,8 +1149,8 @@ class FuncGen:
         if m == "insertps" and imm is not None:
             v = "%s.f[%d]" % (self.xmm(ops[1]), (imm >> 6) & 3) if self.isx(ops[1]) else "rdf(%s)" % self.ea(ops[1])
             e("{ XMM d_ = %s; d_.f[%d] = %s; for (int k = 0; k < 4; k++) if (%d >> k & 1) d_.u[k] = 0; %s = d_; }" % (D, (imm >> 4) & 3, v, imm & 15, D)); return True
-        if m in ("blendps", "blendpd") and imm is not None:
-            f, n = ("u", 4) if m == "blendps" else ("q", 2)
+        if m in ("blendps", "blendpd", "pblendw") and imm is not None:
+            f, n = {"blendps": ("u", 4), "blendpd": ("q", 2), "pblendw": ("w", 8)}[m]
             idx = ", ".join(str(n + k if imm >> k & 1 else k) for k in range(n))
             e("{ XMM s_ = %s, d_ = %s; d_.v%s = __builtin_shufflevector(d_.v%s, s_.v%s, %s); %s = d_; }" % (S_(ops[1]), D, f, f, f, idx, D)); return True
         if m in ("pmovsxdq", "pmovzxdq", "pmovsxwd", "pmovzxwd", "pmovsxbd", "pmovzxbd", "pmovsxbw", "pmovzxbw", "pmovsxwq", "pmovzxwq", "pmovsxbq", "pmovzxbq") and src:
@@ -1350,16 +1358,26 @@ class Translator:
         # Such a start would cut the previous function's region short (even to nothing), so drop any
         # non-.pdata start that the previous start's straight-line code runs across.
         TERM = ("ret", "jmp", "int3", "ud2", "hlt", "bnd ")
+        JTAB_LOAD = re.compile(r"\[\w+ \+ \w+\*4 \+ (0x[0-9a-f]+)\]")
         while True:
             srt = sorted(starts); drop = set()
             for k in range(1, len(srt)):
                 s, t = srt[k - 1], srt[k]
                 if t in pe.pdata or s in drop: continue
-                a, ended = s, False
+                a, ended, cases, table = s, False, False, None
                 for (x, sz, mn, opst) in lite.disasm_lite(pe.read(s, t - s + 16), s):
                     if x >= t: break
+                    if cases and (mn == "nop" or (table is not None and x >= table)):
+                        ended = True; break   # padding, or the jump table (data) after the case blocks
                     a = x + sz
-                    if mn.startswith(TERM): ended = True; break
+                    tm = JTAB_LOAD.search(opst) if mn in ("mov", "movsxd") else None
+                    if tm: table = pe.base + int(tm.group(1), 16)
+                    if mn.startswith(TERM):
+                        # an MSVC switch dispatch (mov r32,[B+idx*4+rva]; add r,B; jmp r) is followed by its case
+                        # blocks, which often end in tail jumps or rets themselves: keep sweeping them, up to the table
+                        if mn == "jmp" and opst in REG and table is not None and table > x: cases = True; continue
+                        if cases and mn in ("jmp", "ret"): continue
+                        ended = True; break
                 if not ended and a > t: drop.add(t)
             if not drop: break
             print("dropped %d mid-instruction starts: %s" % (len(drop), " ".join("%x" % t for t in sorted(drop))))
