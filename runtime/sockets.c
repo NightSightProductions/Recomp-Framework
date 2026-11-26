@@ -104,11 +104,15 @@ void I_wsock32_dll__23(CPU *c) {
     NT("[net] socket(af %d, type %d, proto %d) -> %d\n", (int)A0, (int)A1, (int)A2, fd);
     RET((uint64_t)fd);
 }
-void I_wsock32_dll__3(CPU *c) { RET(close(sfd(A0)) ? fail() : 0); }   // closesocket
+static void ws_forget(int fd);
+static void ws_connecting(int fd);
+static void ws_write_blocked(int fd);
+void I_wsock32_dll__3(CPU *c) { NT("[net] closesocket(%d)\n", sfd(A0)); ws_forget(sfd(A0)); RET(close(sfd(A0)) ? fail() : 0); }   // closesocket
 // #2 bind(s, addr, len) / #4 connect(s, addr, len)
 static void addr_call(CPU *c, int connect_) {
     struct sockaddr_storage a; socklen_t n = addr_in(A1, (uint32_t)A2, &a);
     if (!n) { set_last_error(10047); RET(SOCKET_ERROR); return; }
+    if (connect_) ws_connecting(sfd(A0));
     int r = connect_ ? connect(sfd(A0), (struct sockaddr *)&a, n) : bind(sfd(A0), (struct sockaddr *)&a, n);
     NT("[net] %s(%d) -> %d (errno %d)\n", connect_ ? "connect" : "bind", sfd(A0), r, r ? errno : 0);
     RET(r ? fail() : 0);
@@ -175,7 +179,11 @@ void I_wsock32_dll__7(CPU *c) {
 }
 // #16 recv(s, buf, len, flags) / #19 send(s, buf, len, flags): MSG_OOB 1, MSG_PEEK 2 match
 void I_wsock32_dll__16(CPU *c) { ssize_t r = recv(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 3); RET(r < 0 ? fail() : (uint32_t)r); }
-void I_wsock32_dll__19(CPU *c) { ssize_t r = send(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 1); RET(r < 0 ? fail() : (uint32_t)r); }
+void I_wsock32_dll__19(CPU *c) {
+    ssize_t r = send(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 1);
+    if (r < 0 && errno == EWOULDBLOCK) ws_write_blocked(sfd(A0));
+    RET(r < 0 ? fail() : (uint32_t)r);
+}
 // #17 recvfrom(s, buf, len, flags, from, *fromlen)
 void I_wsock32_dll__17(CPU *c) {
     struct sockaddr_storage a; socklen_t n = sizeof a;
@@ -218,6 +226,16 @@ void I_wsock32_dll__18(CPU *c) {
     set_out(A1, &r); set_out(A2, &w); set_out(A3, &e);
     RET((uint32_t)n);
 }
+// #1 accept(s, addr, *len) / #13 listen(s, backlog) / #22 shutdown(s, how): SD_RECEIVE 0, SD_SEND 1, SD_BOTH 2 match
+void I_wsock32_dll__1(CPU *c) {
+    struct sockaddr_storage a; socklen_t n = sizeof a;
+    int fd = accept(sfd(A0), (struct sockaddr *)&a, &n);
+    if (fd < 0) { set_last_error(wsa_err(errno)); RET(INVALID_SOCKET); return; }
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    addr_out(&a, A1, A2); RET((uint64_t)fd);
+}
+void I_wsock32_dll__13(CPU *c) { RET(listen(sfd(A0), (int)A1) ? fail() : 0); }
+void I_wsock32_dll__22(CPU *c) { RET(shutdown(sfd(A0), (int)A1) ? fail() : 0); }
 // #8 htonl, #9 htons, #14 ntohl, #15 ntohs
 void I_wsock32_dll__8(CPU *c) { RET(__builtin_bswap32((uint32_t)A0)); }
 void I_wsock32_dll__9(CPU *c) { RET(__builtin_bswap16((uint16_t)A0)); }
@@ -300,4 +318,241 @@ void I_iphlpapi_dll_GetAdaptersInfo(CPU *c) {
         snprintf(PTR(p + 488 + 8), 16, "0.0.0.0");
     }
     RET(0);
+}
+
+// ---------------- ws2_32.dll ----------------
+// The by-ordinal exports are wsock32's (1-23 match except 10-12: ioctlsocket, inet_addr, inet_ntoa).
+#define WS2_SAME(n) void I_ws2_32_dll__##n(CPU *c) { I_wsock32_dll__##n(c); }
+WS2_SAME(1) WS2_SAME(2) WS2_SAME(3) WS2_SAME(4) WS2_SAME(5) WS2_SAME(6) WS2_SAME(7) WS2_SAME(8) WS2_SAME(9)
+WS2_SAME(13) WS2_SAME(14) WS2_SAME(15) WS2_SAME(16) WS2_SAME(17) WS2_SAME(18) WS2_SAME(19) WS2_SAME(20)
+WS2_SAME(21) WS2_SAME(22) WS2_SAME(23) WS2_SAME(52) WS2_SAME(57) WS2_SAME(111) WS2_SAME(112) WS2_SAME(115) WS2_SAME(116)
+void I_ws2_32_dll__10(CPU *c) { I_wsock32_dll__12(c); }
+void I_ws2_32_dll__11(CPU *c) { I_wsock32_dll__10(c); }
+void I_ws2_32_dll__12(CPU *c) { I_wsock32_dll__11(c); }
+// #151 __WSAFDIsSet(s, fd_set*)
+void I_ws2_32_dll__151(CPU *c) {
+    uint32_t n = rd32(A1); if (n > 64) n = 64;
+    for (uint32_t i = 0; i < n; i++) if (rd64(A1 + 8 + 8ull * i) == A0) { RET(1); return; }
+    RET(0);
+}
+#define WS2_NAMED(name, n) void I_ws2_32_dll_##name(CPU *c) { I_ws2_32_dll__##n(c); }
+WS2_NAMED(accept, 1) WS2_NAMED(bind, 2) WS2_NAMED(closesocket, 3) WS2_NAMED(connect, 4) WS2_NAMED(getpeername, 5)
+WS2_NAMED(getsockname, 6) WS2_NAMED(getsockopt, 7) WS2_NAMED(htonl, 8) WS2_NAMED(htons, 9) WS2_NAMED(ioctlsocket, 10)
+WS2_NAMED(inet_addr, 11) WS2_NAMED(inet_ntoa, 12) WS2_NAMED(listen, 13) WS2_NAMED(ntohl, 14) WS2_NAMED(ntohs, 15)
+WS2_NAMED(recv, 16) WS2_NAMED(recvfrom, 17) WS2_NAMED(select, 18) WS2_NAMED(send, 19) WS2_NAMED(sendto, 20)
+WS2_NAMED(setsockopt, 21) WS2_NAMED(shutdown, 22) WS2_NAMED(socket, 23) WS2_NAMED(gethostbyname, 52)
+WS2_NAMED(gethostname, 57) WS2_NAMED(WSAGetLastError, 111) WS2_NAMED(WSASetLastError, 112) WS2_NAMED(WSAStartup, 115)
+WS2_NAMED(WSACleanup, 116) WS2_NAMED(__WSAFDIsSet, 151)
+
+// WSASocketW(af, type, protocol, protocolInfo, group, flags): overlapped I/O is not used by the callers seen
+void I_ws2_32_dll_WSASocketW(CPU *c) { I_wsock32_dll__23(c); }
+void I_ws2_32_dll_WSASocketA(CPU *c) { I_wsock32_dll__23(c); }
+
+// getaddrinfo / GetAddrInfoW. Win64 ADDRINFO: ai_flags +0, ai_family +4, ai_socktype +8, ai_protocol +12,
+// ai_addrlen (size_t) +16, ai_canonname +24, ai_addr +32, ai_next +40. Flags 1-4 and AI_ADDRCONFIG (0x400) match.
+static uint32_t eai_err(int e) {
+    switch (e) {
+    case EAI_AGAIN: return 11002;      // WSATRY_AGAIN
+    case EAI_NONAME: return 11001;     // WSAHOST_NOT_FOUND
+    case EAI_FAIL: return 11003;       // WSANO_RECOVERY
+    case EAI_FAMILY: return 10047;     // WSAEAFNOSUPPORT
+    case EAI_MEMORY: return 8;         // WSA_NOT_ENOUGH_MEMORY
+    case EAI_SERVICE: return 10109;    // WSATYPE_NOT_FOUND
+    case EAI_SOCKTYPE: return 10044;   // WSAESOCKTNOSUPPORT
+    default: return 11001;
+    }
+}
+static int addrinfo_call(CPU *c, const char *node, const char *serv, int wide) {
+    struct addrinfo hints = { 0 }, *res = NULL;
+    if (A2) {
+        uint32_t fam = rd32(A2 + 4);
+        hints.ai_flags = (int)(rd32(A2) & 0x407); hints.ai_family = fam == W_AF_INET6 ? AF_INET6 : (int)fam;
+        hints.ai_socktype = (int)rd32(A2 + 8); hints.ai_protocol = (int)rd32(A2 + 12);
+    }
+    int e = getaddrinfo(node, serv, A2 ? &hints : NULL, &res);
+    NT("[net] getaddrinfo(%s, %s) -> %d\n", node ? node : "(null)", serv ? serv : "(null)", e);
+    if (e) { wr64(A3, 0); set_last_error(eai_err(e)); return (int)eai_err(e); }
+    uint64_t head = 0, *link = &head;
+    for (struct addrinfo *r = res; r; r = r->ai_next) {
+        if (r->ai_family != AF_INET && r->ai_family != AF_INET6) continue;
+        uint8_t *g = calloc(1, 48 + 32);
+        uint64_t p = G(g);
+        wr32(p, (uint32_t)r->ai_flags); wr32(p + 4, r->ai_family == AF_INET6 ? W_AF_INET6 : AF_INET);
+        wr32(p + 8, (uint32_t)r->ai_socktype); wr32(p + 12, (uint32_t)r->ai_protocol);
+        struct sockaddr_storage ss; memset(&ss, 0, sizeof ss); memcpy(&ss, r->ai_addr, r->ai_addrlen);
+        uint32_t len = 32; addr_out(&ss, p + 48, G(&len));
+        wr64(p + 16, len); wr64(p + 32, p + 48);
+        if (r->ai_canonname) {
+            if (wide) wr64(p + 24, G(utf8_to_w16(r->ai_canonname)));
+            else wr64(p + 24, G(strdup(r->ai_canonname)));
+        }
+        *link = p; link = (uint64_t *)PTR(p + 40);
+    }
+    freeaddrinfo(res);
+    wr64(A3, head);
+    return 0;
+}
+void I_ws2_32_dll_getaddrinfo(CPU *c) { RET((uint32_t)addrinfo_call(c, A0 ? PTR(A0) : NULL, A1 ? PTR(A1) : NULL, 0)); }
+void I_ws2_32_dll_GetAddrInfoW(CPU *c) {
+    char *n = A0 ? w16_to_utf8(PTR(A0)) : NULL, *s = A1 ? w16_to_utf8(PTR(A1)) : NULL;
+    RET((uint32_t)addrinfo_call(c, n, s, 1));
+    free(n); free(s);
+}
+void I_ws2_32_dll_freeaddrinfo(CPU *c) {
+    for (uint64_t p = A0; p;) { uint64_t nx = rd64(p + 40); free(PTR(rd64(p + 24))); free(PTR(p)); p = nx; }
+}
+void I_ws2_32_dll_FreeAddrInfoW(CPU *c) { I_ws2_32_dll_freeaddrinfo(c); }
+// inet_ntop(family, addr, buf, size) / inet_pton(family, string, addr)
+void I_ws2_32_dll_inet_ntop(CPU *c) {
+    int fam = (int)A0 == W_AF_INET6 ? AF_INET6 : (int)A0;
+    const char *r = inet_ntop(fam, PTR(A1), PTR(A2), (socklen_t)A3);
+    if (!r) { set_last_error(10047); RET(0); return; }
+    RET(A2);
+}
+void I_ws2_32_dll_inet_pton(CPU *c) {
+    int fam = (int)A0 == W_AF_INET6 ? AF_INET6 : (int)A0;
+    int r = inet_pton(fam, PTR(A1), PTR(A2));
+    if (r < 0) set_last_error(10047);
+    RET((uint32_t)r);
+}
+
+// ---- WSAEventSelect: network events on a socket signal an event object ----
+// A poll thread watches the registered sockets. FD_READ and FD_CLOSE are level conditions, re-armed once the app
+// has collected them (WSAEnumNetworkEvents); FD_CONNECT fires once when a connect completes, FD_WRITE then and
+// again after a send that would have blocked, as on Windows.
+#include <poll.h>
+#include <pthread.h>
+#include "handles.h"
+enum { FD_READ_ = 1, FD_WRITE_ = 2, FD_OOB_ = 4, FD_ACCEPT_ = 8, FD_CONNECT_ = 16, FD_CLOSE_ = 32 };
+typedef struct { int fd; uint64_t event; uint32_t mask, pending, armed; int connecting, closed; uint32_t err[10]; } WsSel;
+static WsSel ws_sel[256]; static int ws_nsel;
+static pthread_mutex_t ws_mu = PTHREAD_MUTEX_INITIALIZER;
+static int ws_wake[2] = { -1, -1 };
+static WsSel *ws_find(int fd) { for (int i = 0; i < ws_nsel; i++) if (ws_sel[i].fd == fd) return &ws_sel[i]; return NULL; }
+static void ws_poke(void) { if (ws_wake[1] >= 0) { char b = 0; (void)!write(ws_wake[1], &b, 1); } }
+static void ws_set_event(uint64_t h) {
+    h_lock(); HObj *o = h_get(h); if (o) { o->state = 1; h_wake(o); } h_unlock();
+}
+static void ws_report(WsSel *s, uint32_t bits) {   // ws_mu held
+    bits &= s->mask & ~s->pending;
+    if (!bits) return;
+    s->pending |= bits;
+    ws_set_event(s->event);
+}
+static void *ws_poller(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct pollfd pf[257]; int idx[257], n = 0;
+        pthread_mutex_lock(&ws_mu);
+        pf[n].fd = ws_wake[0]; pf[n].events = POLLIN; idx[n++] = -1;
+        for (int i = 0; i < ws_nsel; i++) {
+            WsSel *s = &ws_sel[i]; short ev = 0;
+            uint32_t want = s->mask & s->armed & ~s->pending;
+            if (s->closed) continue;
+            if (s->connecting) { if (want & (FD_CONNECT_ | FD_WRITE_ | FD_CLOSE_)) ev |= POLLOUT; }
+            else {
+                if (want & (FD_READ_ | FD_CLOSE_ | FD_ACCEPT_)) ev |= POLLIN;
+                if (want & FD_WRITE_) ev |= POLLOUT;
+            }
+            if (ev) { pf[n].fd = s->fd; pf[n].events = ev; idx[n++] = i; }
+        }
+        pthread_mutex_unlock(&ws_mu);
+        if (poll(pf, (nfds_t)n, -1) < 0) continue;
+        if (pf[0].revents) { char b[64]; while (read(ws_wake[0], b, sizeof b) == sizeof b) {} }
+        pthread_mutex_lock(&ws_mu);
+        for (int k = 1; k < n; k++) {
+            if (!pf[k].revents || idx[k] >= ws_nsel || ws_sel[idx[k]].fd != pf[k].fd) continue;
+            WsSel *s = &ws_sel[idx[k]];
+            if (s->connecting) {
+                int e = 0; socklen_t l = sizeof e; getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &e, &l);
+                s->connecting = 0;
+                s->err[4] = e ? wsa_err(e) : 0;
+                ws_report(s, e ? FD_CONNECT_ : (FD_CONNECT_ | FD_WRITE_));
+                if (!e) s->armed &= ~FD_WRITE_;   // reported once; again after a blocked send
+                continue;
+            }
+            if (pf[k].revents & (POLLIN | POLLHUP | POLLERR)) {
+                char b; ssize_t r = recv(s->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (s->mask & FD_ACCEPT_ && r < 0 && errno == ENOTCONN) ws_report(s, FD_ACCEPT_);
+                else if (r > 0) ws_report(s, FD_READ_);
+                else if (r == 0 || (r < 0 && errno != EWOULDBLOCK)) {
+                    s->err[5] = r == 0 ? 0 : wsa_err(errno);
+                    s->closed = 1; ws_report(s, FD_CLOSE_);
+                }
+            }
+            if (pf[k].revents & POLLOUT && s->armed & FD_WRITE_) { s->armed &= ~FD_WRITE_; ws_report(s, FD_WRITE_); }
+        }
+        pthread_mutex_unlock(&ws_mu);
+    }
+    return NULL;
+}
+static void ws_init(void) {
+    if (pipe(ws_wake)) return;
+    fcntl(ws_wake[0], F_SETFL, O_NONBLOCK); fcntl(ws_wake[1], F_SETFL, O_NONBLOCK);
+    pthread_t t; pthread_create(&t, NULL, ws_poller, NULL); pthread_detach(t);
+}
+static void ws_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, ws_init); }
+static void ws_forget(int fd) {
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd); if (s) *s = ws_sel[--ws_nsel];
+    pthread_mutex_unlock(&ws_mu); ws_poke();
+}
+static void ws_connecting(int fd) {
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd); if (s) { s->connecting = 1; s->closed = 0; s->armed |= FD_CONNECT_ | FD_WRITE_ | FD_CLOSE_; }
+    pthread_mutex_unlock(&ws_mu); if (s) ws_poke();
+}
+static void ws_write_blocked(int fd) {
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd); if (s) s->armed |= FD_WRITE_;
+    pthread_mutex_unlock(&ws_mu); if (s) ws_poke();
+}
+// WSAEventSelect(s, event, mask): the socket becomes non-blocking
+void I_ws2_32_dll_WSAEventSelect(CPU *c) {
+    int fd = sfd(A0); uint32_t mask = (uint32_t)A2;
+    ws_start();
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd);
+    if (!mask || !A1) { if (s) *s = ws_sel[--ws_nsel]; pthread_mutex_unlock(&ws_mu); ws_poke(); RET(0); return; }
+    if (!s) {
+        if (ws_nsel == 256) { pthread_mutex_unlock(&ws_mu); set_last_error(10024); RET(SOCKET_ERROR); return; }
+        s = &ws_sel[ws_nsel++]; memset(s, 0, sizeof *s); s->fd = fd;
+        // an already connected socket is writable now
+        struct sockaddr_storage a; socklen_t l = sizeof a;
+        s->armed = FD_READ_ | FD_CLOSE_ | FD_ACCEPT_ | FD_OOB_ | (getpeername(fd, (struct sockaddr *)&a, &l) == 0 ? FD_WRITE_ : 0);
+    }
+    s->event = A1; s->mask = mask;
+    pthread_mutex_unlock(&ws_mu);
+    int fl = fcntl(fd, F_GETFL); if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    NT("[net] WSAEventSelect(%d, mask 0x%x)\n", fd, mask);
+    ws_poke(); RET(0);
+}
+// WSAEnumNetworkEvents(s, event, WSANETWORKEVENTS { long lNetworkEvents; int iErrorCode[10]; })
+void I_ws2_32_dll_WSAEnumNetworkEvents(CPU *c) {
+    int fd = sfd(A0);
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd); uint32_t ev = 0;
+    if (s) {
+        ev = s->pending; s->pending = 0;
+        if (A2) { wr32(A2, ev); for (int i = 0; i < 10; i++) wr32(A2 + 4 + 4 * i, (ev >> i) & 1 ? s->err[i] : 0); }
+    } else if (A2) memset(PTR(A2), 0, 44);
+    pthread_mutex_unlock(&ws_mu);
+    if (A1) { h_lock(); HObj *o = h_get(A1); if (o) o->state = 0; h_unlock(); }
+    ws_poke();
+    RET(0);
+}
+// WSA event objects are manual-reset kernel events
+void I_kernel32_dll_CreateEventW(CPU *c);
+void I_kernel32_dll_SetEvent(CPU *c);
+void I_kernel32_dll_ResetEvent(CPU *c);
+void I_kernel32_dll_CloseHandle(CPU *c);
+void I_ws2_32_dll_WSACreateEvent(CPU *c) { c->rcx = 0; c->rdx = 1; c->r8 = 0; c->r9 = 0; I_kernel32_dll_CreateEventW(c); }
+void I_ws2_32_dll_WSASetEvent(CPU *c) { I_kernel32_dll_SetEvent(c); }
+void I_ws2_32_dll_WSAResetEvent(CPU *c) { I_kernel32_dll_ResetEvent(c); }
+void I_ws2_32_dll_WSACloseEvent(CPU *c) { I_kernel32_dll_CloseHandle(c); }
+// WSAWaitForMultipleEvents(n, events, waitAll, timeout, alertable): WSA_WAIT_EVENT_0 / WSA_WAIT_TIMEOUT as WAIT_*
+void I_ws2_32_dll_WSAWaitForMultipleEvents(CPU *c) {
+    uint32_t n = (uint32_t)A0; uint64_t hs[64];
+    for (uint32_t i = 0; i < n && i < 64; i++) hs[i] = rd64(A1 + 8 * i);
+    RET(h_wait((int)(n < 64 ? n : 64), hs, (int)A2, (uint32_t)A3));
 }

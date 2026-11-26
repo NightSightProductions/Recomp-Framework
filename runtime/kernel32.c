@@ -619,7 +619,7 @@ static const char *known_dlls[] = { "kernel32", "kernelbase", "ntdll", "user32",
     "oleaut32", "shlwapi", "winmm", "xinput1_4", "xinput1_3", "xinput9_1_0", "xaudio2_9", "xaudio2_8", "xaudio2_7",
     "dinput8", "vulkan-1", "bcrypt", "dbghelp", "uxtheme", "dwmapi", "imm32", "setupapi", "ws2_32", "wsock32",
     "winhttp", "iphlpapi", "steam_api64", "bink2w64", "version", "powrprof", "combase",
-    "cchromaeditorlibrary", "pdh", NULL };   // Razer Chroma plugin shipped with the game: every export reports "not initialized"
+    "cchromaeditorlibrary", "pdh", "security", "secur32", "sspicli", NULL };   // Razer Chroma plugin shipped with the game: every export reports "not initialized"
 static void dll_base(const char *name, char *out, size_t n) {
     // "C:\x\KERNEL32.DLL" -> "kernel32"; api-ms-win-core-* -> kernel32
     const char *b = name; for (const char *p = name; *p; p++) if (*p == '\\' || *p == '/') b = p + 1;

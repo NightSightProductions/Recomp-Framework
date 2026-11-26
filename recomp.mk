@@ -77,7 +77,7 @@ $(BUILD)/libgame.a: $(GEN_OBJ)
 # ---- runtime ----
 FW_RT_C = rt.c teb.c kernel32.c handles.c files.c vulkan.c display.c window.c bcrypt.c input.c xaudio2.c pdh.c \
           system.c dinput.c sockets.c wasapi.c fiber.c user32.c steam.c native.c spvfix.c setjmp.c xreverb.c \
-          ucrt.c ucrt_stdio.c vcruntime.c msvcp.c cxxeh.c
+          ucrt.c ucrt_stdio.c vcruntime.c msvcp.c cxxeh.c schannel.c
 FW_RT_M = cocoa.m winhttp.m gamepad.m gpucapture.m opengl.m
 RT_OBJ  = $(patsubst %.c,$(BUILD)/fw/%.o,$(FW_RT_C)) $(patsubst %.m,$(BUILD)/fw/%.o,$(FW_RT_M))
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
@@ -98,7 +98,7 @@ $(BUILD)/game/%.o: %.c $(FW_HDR)
 LDFLAGS ?= $(ARCH) -Wl,-export_dynamic -Wl,-segaddr,__GUEST,0x140000000 -Wl,-segaddr,__GUESTDLL,0x160000000 \
            -framework CoreGraphics -framework CoreFoundation -framework AppKit -framework QuartzCore \
            -framework AudioToolbox -framework CoreAudio -framework GameController -framework CoreHaptics -framework Metal \
-           -framework OpenGL -framework IOSurface
+           -framework OpenGL -framework IOSurface -framework Security
 
 $(BUILD)/boot: $(BUILD)/libgame.a $(EXTRA_LIBS) $(EXTRA_LIBS_FORCE) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/fw/boot.o $(FW)/runtime/boot-Info.plist
 	$(CC) $(LDFLAGS) $(PGO_LDFLAGS) -Wl,-sectcreate,__TEXT,__info_plist,$(FW)/runtime/boot-Info.plist $(BUILD)/fw/boot.o $(RT_OBJ) $(GAME_OBJ) \
