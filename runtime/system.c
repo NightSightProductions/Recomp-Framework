@@ -41,6 +41,8 @@ static int put_name(uint64_t buf, uint64_t psize, const char *s, int count_nul) 
     memcpy(PTR(buf), s, need); wr32(psize, count_nul ? need : need - 1);
     return 1;
 }
+// SystemFunction036 (RtlGenRandom)(buffer, length): cryptographic random bytes
+void I_advapi32_dll_SystemFunction036(CPU *c) { if (A0 && A1) arc4random_buf(PTR(A0), (size_t)(uint32_t)A1); RET(1); }
 void I_advapi32_dll_GetUserNameA(CPU *c) { RET(put_name(A0, A1, "Player", 1)); }
 void I_kernel32_dll_GetComputerNameA(CPU *c) { RET(put_name(A0, A1, rt_game.computer_name ? rt_game.computer_name : "MAC", 0)); }
 // GetComputerNameExA(format, buf, *size): the domain forms (DnsDomain 2, PhysicalDnsDomain 6) are empty (no domain);

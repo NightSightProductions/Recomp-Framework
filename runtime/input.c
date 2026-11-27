@@ -93,6 +93,14 @@ static void guid_str(uint64_t g, char *out, size_t n) {
 void I_ole32_dll_CoInitialize(CPU *c) { RET(0); }
 void I_ole32_dll_CoInitializeEx(CPU *c) { RET(0); }
 void I_ole32_dll_CoUninitialize(CPU *c) { }
+void I_ole32_dll_CoInitializeSecurity(CPU *c) { RET(0); }
+// CoCreateGuid(GUID *): a random (version 4) GUID
+void I_ole32_dll_CoCreateGuid(CPU *c) {
+    if (!A0) { RET(0x80070057u); return; }   // E_INVALIDARG
+    uint8_t *g = PTR(A0); arc4random_buf(g, 16);
+    g[7] = (uint8_t)((g[7] & 0x0F) | 0x40); g[8] = (uint8_t)((g[8] & 0x3F) | 0x80);   // Data3 high nibble 4, variant 10
+    RET(0);
+}
 // CoCreateInstance(rclsid, outer, clsctx, riid, *ppv)
 uint32_t xaudio2_cocreate(uint64_t clsid, uint64_t iid, uint64_t ppv);   // xaudio2.c
 uint32_t wasapi_cocreate(uint64_t clsid, uint64_t iid, uint64_t ppv);    // wasapi.c
