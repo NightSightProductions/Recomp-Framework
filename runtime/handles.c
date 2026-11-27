@@ -335,17 +335,32 @@ void I_kernel32_dll_SleepConditionVariableCS(CPU *c) {
     RET(cv_sleep(cv_of(A0), (uint32_t)A2, cs_unlock, cs_lock, &r));
 }
 
-// InitOnceExecuteOnce(once, fn(once, param, ctx), param, ctx)
+// InitOnceExecuteOnce(once, fn(once, param, ctx), param, ctx). Each INIT_ONCE is its own: 0 not run, 1 running,
+// 2 done. The thread that moves it from 0 to 1 runs fn; others calling for the same object wait until it is done
+// (or back to 0 when fn failed, and then try themselves). Nothing is held while fn runs, so a callback may run
+// other one-time inits or wait for threads that do.
 static pthread_mutex_t once_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t once_cv = PTHREAD_COND_INITIALIZER;
 void I_kernel32_dll_InitOnceExecuteOnce(CPU *c) {
     uint64_t once = A0, fn = A1, param = A2, ctx = A3;
-    pthread_mutex_lock(&once_mu);   // serializes all one-time inits; fine for startup code
-    int r = 1;
-    if (rd64(once) != 2) {
-        uint64_t a[3] = { once, param, ctx };
-        r = (int)(guest_call(c, fn, 3, a) & 0xFFFFFFFF) != 0;
-        if (r) wr64(once, 2);
+    uint64_t *w = PTR(once);
+    for (;;) {
+        uint64_t v = __atomic_load_n(w, __ATOMIC_ACQUIRE);
+        if (v == 2) { RET(1); return; }
+        if (v == 0) {
+            uint64_t z = 0;
+            if (__atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+            continue;
+        }
+        pthread_mutex_lock(&once_mu);
+        while (__atomic_load_n(w, __ATOMIC_ACQUIRE) == 1) pthread_cond_wait(&once_cv, &once_mu);
+        pthread_mutex_unlock(&once_mu);
     }
+    uint64_t a[3] = { once, param, ctx };
+    int r = (int)(guest_call(c, fn, 3, a) & 0xFFFFFFFF) != 0;
+    pthread_mutex_lock(&once_mu);
+    __atomic_store_n(w, r ? 2 : 0, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&once_cv);
     pthread_mutex_unlock(&once_mu);
     RET(r);
 }
