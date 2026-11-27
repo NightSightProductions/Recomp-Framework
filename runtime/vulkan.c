@@ -903,13 +903,14 @@ void I_vulkan_1_dll_vkQueuePresentKHR(CPU *c) {
     if (((shot_at > 0 && (long)n == shot_at) || shot_pending) && screenshot((VkQueue)PTR(A0), &pi)) { pi.waitSemaphoreCount = 0; pi.pWaitSemaphores = NULL; }
     shot_pending = 0;
     if (dump_on > 0 && snap_state == 2 && snap_readback((VkQueue)PTR(A0), &pi)) { pi.waitSemaphoreCount = 0; pi.pWaitSemaphores = NULL; }
-    // RT_MAX_FPS=N caps presents at N per second (default 60, 0 = uncapped) in every vsync mode, so a 120 Hz
-    // display doesn't make the GPU and the game's job threads run twice as hard; the render thread sleeps here.
+    // RT_MAX_FPS=N caps presents at N per second in every vsync mode (unset or 0 = uncapped), so a 120 Hz display
+    // doesn't make the GPU and the game's job threads run twice as hard; the render thread sleeps here. Off unless
+    // set: a game that wants a cap by default sets it before launch (setenv(..., 0) keeps the player's value).
     static uint64_t cap_ns = ~0ull;
     if (cap_ns == ~0ull) {
-        const char *e = getenv("RT_MAX_FPS"); long fps = e ? atol(e) : 60;
+        const char *e = getenv("RT_MAX_FPS"); long fps = e ? atol(e) : 0;
         cap_ns = fps > 0 ? (uint64_t)(1e9 / fps) : 0;
-        rt_log("[vulkan] frame cap %s\n", cap_ns ? (e ? e : "60") : "off");
+        if (cap_ns) rt_log("[vulkan] frame cap %ld\n", fps); else rt_log("[vulkan] frame cap off\n");
     }
     uint64_t interval = g_adaptive ? g_refresh_ns : 0;
     if (cap_ns > interval) interval = cap_ns;
@@ -917,7 +918,9 @@ void I_vulkan_1_dll_vkQueuePresentKHR(CPU *c) {
         static uint64_t next;
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (next > now && next - now < 4 * interval) {
-            struct timespec ts = { 0, (long)(next - now) }; nanosleep(&ts, NULL);
+            // seconds and nanoseconds apart: below 4 fps the wait is over a second, which tv_nsec can't hold
+            uint64_t wait = next - now;
+            struct timespec ts = { (time_t)(wait / 1000000000u), (long)(wait % 1000000000u) }; nanosleep(&ts, NULL);
             now = next;
         }
         next = (next && now - next < interval) ? next + interval : now + interval;
