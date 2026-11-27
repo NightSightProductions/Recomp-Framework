@@ -153,7 +153,7 @@ void I__CFStringGetCString(CPU *c) {
     if (!o || CFGetTypeID(o) != CFStringGetTypeID()) { RET(0); return; }
     RET(CFStringGetCString((CFStringRef)o, S(ARG(1)), (CFIndex)ARG(2), (CFStringEncoding)ARG(3)));
 }
-void I__CFRelease(CPU *c) { cf_release_h(ARG(0)); }
+void I__CFRelease(CPU *c) { if (rt32_game.cf_release) cf_release_h(ARG(0)); }   // 0: handles live for the process
 void I__CFShow(CPU *c) { CFShow(cf(ARG(0))); }
 
 // ---------- numbers / booleans / data ----------

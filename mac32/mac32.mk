@@ -39,11 +39,15 @@ $(BUILD)/gl_gen.c: $(M32)/tools/glgen.py
 GEN_SRC = $(wildcard $(GEN_DIR)/code_*.c) $(GEN_DIR)/tables.c
 GEN_OBJ = $(patsubst %.c,$(BUILD)/%.o,$(GEN_SRC))
 M32_RT  = rt.c shims.c sys.c cxx.c cxxstr.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c objc.c eh.c bink.c
-# Bink movies decode through FFmpeg when it is installed (brew install ffmpeg); otherwise they play as black frames
-FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil 2>/dev/null)
-FFMPEG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil 2>/dev/null)
-ifneq ($(FFMPEG_LIBS),)
-FFMPEG_CFLAGS += -DHAVE_FFMPEG
+# Bink movies: with FFMPEG=1 they decode through FFmpeg (pkg-config libavcodec libavformat libavutil); otherwise they
+# play as black frames. Opt-in: the app then links FFmpeg's dylibs, which `make bundle` does not copy, so a project that
+# ships with FFMPEG=1 has to bundle them (and check FFmpeg's license for the build it uses).
+FFMPEG ?= 0
+FFMPEG_CFLAGS :=
+FFMPEG_LIBS   :=
+ifeq ($(FFMPEG),1)
+FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil) -DHAVE_FFMPEG
+FFMPEG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil)
 endif
 RT_OBJ  = $(patsubst %.c,$(BUILD)/m32/%.o,$(M32_RT)) $(BUILD)/m32/host.o $(BUILD)/m32/pad.o $(BUILD)/gl_gen.o
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))

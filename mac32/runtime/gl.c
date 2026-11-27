@@ -6,6 +6,7 @@
 #define GL_SILENCE_DEPRECATION
 #include "rt.h"
 #include "tables.h"
+#include "game32.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -454,7 +455,7 @@ void I__glShaderSource(CPU *c) {
     // and depth-tests later passes against earlier depth (EQUAL/LEQUAL). D3D gives bit-identical positions for identical
     // maths; Apple's GL optimises each shader separately, so some pixels differ in the last bit and fail the test
     // (hatched holes on skinned meshes). RT32_NO_INVARIANT=1 turns this off for A/B tests.
-    if (!getenv("RT32_NO_INVARIANT")) {
+    if (rt32_game.gl_invariant_position && !getenv("RT32_NO_INVARIANT")) {
         GLint st = 0; glGetShaderiv(ARG(0), GL_SHADER_TYPE, &st);
         if (st == GL_VERTEX_SHADER) {
             char *all = patched;
@@ -563,7 +564,7 @@ void I__glBufferData(CPU *c) { gl_trace("glBufferData"); gl_trace_args("glBuffer
     gl_leave(); }
 void I__glBufferDataARB(CPU *c) { I__glBufferData(c); }
 void I__glBufferSubData(CPU *c) { gl_trace("glBufferSubData"); gl_trace_args("glBufferSubData", c, 4); gl_enter(c);
-    static int orphan = -1; if (orphan < 0) orphan = getenv("RT32_NO_UBO_ORPHAN") == NULL;
+    static int orphan = -1; if (orphan < 0) orphan = rt32_game.gl_fast_buffers && getenv("RT32_NO_UBO_ORPHAN") == NULL;
     GLenum target = ARG(0); GLintptr off = (GLintptr)ARG(1); GLsizeiptr len = (GLsizeiptr)ARG(2); const void *data = ARG(3) ? G2H(ARG(3)) : NULL;
     if (orphan > 0 && off == 0 && data) {
         GLint buf = 0; glGetIntegerv(binding_query(target), &buf);
@@ -688,7 +689,7 @@ void I__glMapBuffer(CPU *c) { gl_trace("glMapBuffer");
         gl_map_count++;
         { static int logged; if (logged < 12 && size >= DIRTY_MIN) { logged++; fprintf(stderr, "[gl] big glMapBuffer: buf %d size %d access %#x\n", buf, size, access); } }
         if (access != GL_WRITE_ONLY) { glGetBufferSubData(target, 0, size, M + m->shadow); gl_readback_bytes += (uint64_t)size; }
-        if (gl_mapfix < 0) gl_mapfix = getenv("RT32_NO_MAPFIX") == NULL;
+        if (gl_mapfix < 0) gl_mapfix = rt32_game.gl_fast_buffers && getenv("RT32_NO_MAPFIX") == NULL;
         if (gl_mapfix && access != GL_READ_ONLY && size >= DIRTY_MIN && (m->shadow & ((uint32_t)getpagesize() - 1)) == 0) {
             m->flushed = 2; dirty_begin(i, m->shadow, size); }   // flushed == 2: dirty-tracked mapping
         RET(m->shadow); return;
@@ -705,7 +706,7 @@ static void glUnmapBuffer_impl(CPU *c) { gl_trace("glUnmapBuffer");
     for (int i = 0; i < 64; i++) if (maps[i].shadow && maps[i].buf == (GLuint)buf && maps[i].target == target) {
         Mapping *m = &maps[i];
         if (m->alias) { alias_unmap(m); m->shadow = 0; m->alias = 0; RET(GL_TRUE); return; }
-        if (gl_mapfix < 0) gl_mapfix = getenv("RT32_NO_MAPFIX") == NULL;
+        if (gl_mapfix < 0) gl_mapfix = rt32_game.gl_fast_buffers && getenv("RT32_NO_MAPFIX") == NULL;
         if (m->ranged && m->flushed == 2) dirty_end(i, target, m->dsize, m->off, m->off + m->size);
         else if (m->ranged) {
             if ((m->access & GL_MAP_WRITE_BIT) && !m->flushed) { glBufferSubData(target, m->off, m->size, M + m->shadow + m->off); gl_unmap_bytes += (uint64_t)m->size; }
@@ -932,8 +933,8 @@ void I__glMapBufferRange(CPU *c) { gl_trace("glMapBufferRange"); gl_trace_args("
     if (!buf || len <= 0 || size <= 0 || off + len > size) { RET(0); return; }
     map_chain_log(c, len, acc);
     // "Alias" = the game's mapped vertex/index buffers point straight at the GL driver's memory (mach_vm_remap) instead
-    // of being copied on every map/unmap. Default ON since 2026-11-24; RT32_NO_ALIAS=1 turns it off, RT32_ALIAS=n forces a mode.
-    if (gl_alias < 0) { const char *e = getenv("RT32_ALIAS"); gl_alias = e ? atoi(e) : (getenv("RT32_NO_ALIAS") ? 0 : 1); if (gl_alias) fprintf(stderr, "[alias] mode %d%s\n", gl_alias, e ? "" : " (default; RT32_NO_ALIAS=1 turns it off)"); }   /* default on after ~3 h of play with it on and 0-byte-difference checks */
+    // of being copied on every map/unmap. On with rt32_game.gl_fast_buffers; RT32_NO_ALIAS=1 turns it off, RT32_ALIAS=n forces a mode.
+    if (gl_alias < 0) { const char *e = getenv("RT32_ALIAS"); gl_alias = e ? atoi(e) : (rt32_game.gl_fast_buffers && !getenv("RT32_NO_ALIAS")); if (gl_alias) fprintf(stderr, "[alias] mode %d%s\n", gl_alias, e ? "" : " (rt32_game.gl_fast_buffers; RT32_NO_ALIAS=1 turns it off)"); }
     if (gl_alias && (acc & GL_MAP_WRITE_BIT) && !(acc & (GL_MAP_READ_BIT | GL_MAP_FLUSH_EXPLICIT_BIT)) && size >= DIRTY_MIN) {
         uint32_t g = alias_map(target, (GLuint)buf, size, off, len, acc);
         if (g) for (int i = 0; i < 64; i++) if (!maps[i].shadow) {
@@ -952,7 +953,7 @@ void I__glMapBufferRange(CPU *c) { gl_trace("glMapBufferRange"); gl_trace_args("
         gl_map_count++;
         if (acc & GL_MAP_READ_BIT) { glGetBufferSubData(target, off, len, M + m->shadow + off); gl_readback_bytes += (uint64_t)len; }
         { static int logged; if (logged < 12 && len >= DIRTY_MIN) { logged++; fprintf(stderr, "[gl] big glMapBufferRange: buf %d size %d off %d len %d access %#x\n", buf, size, off, len, acc); } }
-        if (gl_mapfix < 0) gl_mapfix = getenv("RT32_NO_MAPFIX") == NULL;
+        if (gl_mapfix < 0) gl_mapfix = rt32_game.gl_fast_buffers && getenv("RT32_NO_MAPFIX") == NULL;
         if (gl_mapfix && (acc & GL_MAP_WRITE_BIT) && !m->flushed && size >= DIRTY_MIN && (m->shadow & ((uint32_t)getpagesize() - 1)) == 0) {
             m->flushed = 2; m->dsize = size; dirty_begin(i, m->shadow, size); }   // whole buffer protected; upload clipped to the range
         RET(m->shadow + (uint32_t)off); return;

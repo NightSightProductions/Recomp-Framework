@@ -20,6 +20,15 @@ typedef struct {
     // check_game_binary in host.m). NULL exe_sha256 = no check.
     const char *exe_sha256;  // lowercase hex SHA-256 of <app_bundle>/Contents/MacOS/<exe_name>
     const char *exe_version; // human-readable name of that build, shown when the check fails
+    // Opt-in behaviour (0 keeps what existing mac32 ports were built and tested against). The RT32_NO_* variables
+    // still turn each one off for A/B runs.
+    int gl_fast_buffers;     // mapped buffers: alias the driver's memory (RT32_ALIAS=n picks a mode), upload only
+                             // dirty pages, and turn whole-buffer glBufferSubData into glBufferData (orphaning)
+    int gl_invariant_position; // add `invariant gl_Position;` to vertex shaders (GLSL 1.20+), for multi-pass
+                             // depth EQUAL tests
+    int metalfx;             // MetalFX spatial upscaling when the game blits a smaller frame to the window
+    int cf_release;          // CFRelease really releases (guest handle reference counts); 0: handles live for the
+                             // process, as before
 } Rt32Game;
 
 extern const Rt32Game rt32_game;

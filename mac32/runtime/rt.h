@@ -51,11 +51,11 @@ void rt_mc_hit(uint32_t a, uint32_t n);
 // ---- guest memory ----
 // x86 is TSO: a thread's stores become visible in program order and loads aren't reordered with other loads.
 // ARM64 is weaker, so lock-free guest code (e.g. UE3's render command ring: write the command, then the
-// write pointer) breaks with plain accesses. With RT_TSO (default) aligned guest loads are acquire and
+// write pointer) breaks with plain accesses. With RT_TSO=1 aligned guest loads are acquire and
 // stores release (LDAPR/STLR), unaligned ones are bracketed with fences. Stack accesses (esp/ebp based,
 // thread-private) use the plain rds*/wrs* accessors; the generator picks them. Same scheme as runtime/cpu.h.
-#ifndef RT_TSO
-#define RT_TSO 1
+#ifndef RT_TSO   // off by default on mac32 (plain accesses, as before); a project turns it on with -DRT_TSO=1
+#define RT_TSO 0
 #endif
 #define RT_PLAIN(T, n) \
     static inline __attribute__((always_inline)) T rds##n(uint32_t a) { T v; memcpy(&v, M + a, sizeof v); return v; } \

@@ -747,3 +747,22 @@ uint32_t rt_import_addr(const char *name) {
 void rt_set_data_import(const char *name, uint32_t guest_addr) {
     for (int i = 0; i < ngptrs; i++) if (!strcmp(gptrs[i].name, name)) wr32(gptrs[i].addr, guest_addr);
 }
+
+// ---- weak fallbacks ----
+// Tables that recomp32.py writes into tables.c since C++ exception support: code translated by an older
+// recomp32.py still links (no data symbols, no landing pads). The generated tables override these.
+__attribute__((weak)) const GDef gdefs[1] = {{0, 0}};  __attribute__((weak)) const int ngdefs = 0;
+__attribute__((weak)) const GFde gfdes[1] = {{0, 0}};  __attribute__((weak)) const int ngfdes = 0;
+__attribute__((weak)) const GEHSite gehsites[1] = {{0}}; __attribute__((weak)) const int ngehsites = 0;
+__attribute__((weak)) const GEHAct gehacts[1] = {{0}};   __attribute__((weak)) const int ngehacts = 0;
+// Host and GL hooks the core runtime calls: a build without host.m and gl.c (a headless test linking only part of
+// the runtime) gets these no-ops. host.m and gl.c define the real ones.
+__attribute__((weak)) volatile int host_present_count;
+__attribute__((weak)) volatile CPU *gl_in_cpu;
+__attribute__((weak)) volatile uint64_t gl_ticks_total;
+__attribute__((weak)) volatile uint64_t rt_hitch_io_ticks, rt_hitch_io_bytes;
+__attribute__((weak)) int gl_dirty_fault(uintptr_t fa) { (void)fa; return 0; }
+__attribute__((weak)) void rt_touch_write(uint32_t g, uint32_t n) { (void)g; (void)n; }
+__attribute__((weak)) void *host_cgl_context(void) { return NULL; }
+__attribute__((weak)) void host_note_gl_bind(void) {}
+__attribute__((weak)) const char *host_resources_dir(void) { return "."; }

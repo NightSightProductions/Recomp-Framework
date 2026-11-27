@@ -108,7 +108,7 @@ static void present_shot(int n) {
 //   backbuffer -> IOSurface A[i] (GL blit, flipped for Metal) -> MTLFXSpatialScaler -> texture B -> CAMetalLayer drawable.
 // The picture is presented by a Metal layer view laid over the GL view; nothing waits for the GPU (the first version
 // went back into GL and had to waitUntilCompleted: measured 17.0 -> 24.5 ms per frame). The GL swap is skipped for
-// frames presented this way (host_present). F9 switches back to the plain GL stretch; RT32_NO_METALFX=1 disables.
+// frames presented this way (host_present). On with rt32_game.metalfx; F9 switches back to the plain GL stretch, RT32_NO_METALFX=1 disables.
 // ⚠ GL -> Metal ordering relies on glFlush before the Metal commit (no explicit sync object between the two APIs).
 //
 // Vocabulary for the code below:
@@ -256,7 +256,7 @@ static int mfx_setup(int sw, int sh, int dw, int dh) {   // GL state it disturbs
 // backbuffer). Rects: source in engine pixels, destination already mapped to window pixels. Returns 1 if it took the frame.
 int host_mfx_blit(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1) {
     if (host_mfx_off || mfx_state < 0) { host_mfx_active = 0; mfx_show(0); return 0; }
-    if (mfx_state == 0 && getenv("RT32_NO_METALFX")) { mfx_state = -1; return 0; }
+    if (mfx_state == 0 && (!rt32_game.metalfx || getenv("RT32_NO_METALFX"))) { mfx_state = -1; return 0; }
     int sw = abs(sx1 - sx0), sh = abs(sy1 - sy0), dw = abs(dx1 - dx0), dh = abs(dy1 - dy0);
     int bw = host_back_w, bh = host_back_h;
     if (sw < 320 || sh < 200 || dw <= sw || dh <= sh || bw < dw || bh < dh) { host_mfx_active = 0; mfx_show(0); return 0; }
@@ -348,7 +348,7 @@ int host_mfx_blit(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1,
 //   framebufferOnly = NO   we copy into the drawable with a blit, which needs it to be an ordinary texture
 //   colorspace = nil       no colour management, the same as the GL view, so both paths show identical colours
 static void mfx_make_view(NSView *parent) {   // main thread, at window creation
-    if (getenv("RT32_NO_METALFX")) return;
+    if (!rt32_game.metalfx || getenv("RT32_NO_METALFX")) return;
     mfx_dev = MTLCreateSystemDefaultDevice(); if (!mfx_dev) return;
     mfx_layer = [CAMetalLayer layer];
     mfx_layer.device = mfx_dev; mfx_layer.pixelFormat = MTLPixelFormatBGRA8Unorm; mfx_layer.framebufferOnly = NO;
@@ -602,7 +602,7 @@ static NSView *game_view;
 
 // ---- performance overlay ----
 // Apple's Metal HUD does not attach to an OpenGL game, so this is our own: a small click-through child window in the
-// top-left corner. RT32_HUD=1 shows it at launch; F12 toggles it.
+// top-left corner. RT32_HUD=1 shows it at launch; with RT32_HUD set (to any value), F12 toggles it.
 // It is a separate borderless window attached to the game window (a "child window"), not something drawn by the game:
 // that way it costs the renderer nothing and cannot disturb the game's GL state. A timer refreshes it twice a second.
 // Line 1: fps and frame time averaged over the last 30 frames, and the slowest of those 30 (host_present fills these).
@@ -894,8 +894,9 @@ static void confine_pointer(NSWindow *w) {
 }
 - (void)keyDown:(NSEvent *)e {
     if (scripted() || [e isARepeat]) return;
-    if ([e keyCode] == 111) { hud_toggle(); return; }   // F12: performance overlay
-    if ([e keyCode] == 101) { host_mfx_off = !host_mfx_off; fprintf(stderr, "[mfx] F9: switched to %s at present #%d\n", host_mfx_off ? "PLAIN STRETCH" : "METALFX", host_present_count); return; }
+    // F12 and F9 belong to the game unless the overlay (RT32_HUD set) or MetalFX (rt32_game.metalfx) is in use
+    if ([e keyCode] == 111 && getenv("RT32_HUD")) { hud_toggle(); return; }   // F12: performance overlay
+    if ([e keyCode] == 101 && rt32_game.metalfx) { host_mfx_off = !host_mfx_off; fprintf(stderr, "[mfx] F9: switched to %s at present #%d\n", host_mfx_off ? "PLAIN STRETCH" : "METALFX", host_present_count); return; }
     if ([e keyCode] == 42 && getenv("RT32_DUMP_TARGETS")) { capture_armed = 1; fprintf(stderr, "[host] capture armed (next Return or click)\n"); NSBeep(); return; }   // backslash: arm capture
     if (capture_armed && [e keyCode] == 36) { capture_armed = 0; host_capture_request = 1; }
     rt_hid_key_event([e keyCode], 1);
