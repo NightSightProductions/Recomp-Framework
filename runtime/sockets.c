@@ -81,6 +81,12 @@ static void addr_out(const struct sockaddr_storage *in, uint64_t p, uint64_t ple
     memcpy(PTR(p), buf, n < cap ? n : cap);
     wr32(plen, n);
 }
+static void net_addr_str(const struct sockaddr_storage *a, char *out, size_t n) {
+    char ip[INET6_ADDRSTRLEN] = "?"; int port = 0;
+    if (a->ss_family == AF_INET) { inet_ntop(AF_INET, &((const struct sockaddr_in *)a)->sin_addr, ip, sizeof ip); port = ntohs(((const struct sockaddr_in *)a)->sin_port); }
+    else if (a->ss_family == AF_INET6) { inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)a)->sin6_addr, ip, sizeof ip); port = ntohs(((const struct sockaddr_in6 *)a)->sin6_port); }
+    snprintf(out, n, "%s:%d", ip, port);
+}
 static int sfd(uint64_t s) { return s == INVALID_SOCKET ? -1 : (int)s; }
 // RT_NET_TRACE=1: log socket setup and the first receive on each socket (with its blocking mode)
 static int net_trace = -1;
@@ -107,6 +113,7 @@ void I_wsock32_dll__23(CPU *c) {
 static void ws_forget(int fd);
 static void ws_connecting(int fd);
 static void ws_write_blocked(int fd);
+static void ws_rearm(int fd, uint32_t bits);
 void I_wsock32_dll__3(CPU *c) { NT("[net] closesocket(%d)\n", sfd(A0)); ws_forget(sfd(A0)); RET(close(sfd(A0)) ? fail() : 0); }   // closesocket
 // #2 bind(s, addr, len) / #4 connect(s, addr, len)
 static void addr_call(CPU *c, int connect_) {
@@ -114,7 +121,7 @@ static void addr_call(CPU *c, int connect_) {
     if (!n) { set_last_error(10047); RET(SOCKET_ERROR); return; }
     if (connect_) ws_connecting(sfd(A0));
     int r = connect_ ? connect(sfd(A0), (struct sockaddr *)&a, n) : bind(sfd(A0), (struct sockaddr *)&a, n);
-    NT("[net] %s(%d) -> %d (errno %d)\n", connect_ ? "connect" : "bind", sfd(A0), r, r ? errno : 0);
+    { char h[64]; net_addr_str(&a, h, sizeof h); NT("[net] %s(%d, %s) -> %d (errno %d)\n", connect_ ? "connect" : "bind", sfd(A0), h, r, r ? errno : 0); }
     RET(r ? fail() : 0);
 }
 void I_wsock32_dll__2(CPU *c) { addr_call(c, 0); }
@@ -178,7 +185,7 @@ void I_wsock32_dll__7(CPU *c) {
     wr32(out, (uint32_t)v); wr32(plen, 4); RET(0);
 }
 // #16 recv(s, buf, len, flags) / #19 send(s, buf, len, flags): MSG_OOB 1, MSG_PEEK 2 match
-void I_wsock32_dll__16(CPU *c) { ssize_t r = recv(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 3); RET(r < 0 ? fail() : (uint32_t)r); }
+void I_wsock32_dll__16(CPU *c) { ws_rearm(sfd(A0), 1 | 32); ssize_t r = recv(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 3); RET(r < 0 ? fail() : (uint32_t)r); }
 void I_wsock32_dll__19(CPU *c) {
     ssize_t r = send(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 1);
     if (r < 0 && errno == EWOULDBLOCK) ws_write_blocked(sfd(A0));
@@ -189,7 +196,9 @@ void I_wsock32_dll__17(CPU *c) {
     struct sockaddr_storage a; socklen_t n = sizeof a;
     { static uint8_t seen[1024]; int fd = sfd(A0);
       if (fd >= 0 && fd < 1024 && !seen[fd]) { seen[fd] = 1; NT("[net] first recvfrom(%d, flags %d): %s\n", fd, (int)A3, (fcntl(fd, F_GETFL) & O_NONBLOCK) ? "non-blocking" : "BLOCKING"); } }
+    ws_rearm(sfd(A0), 1 | 32);   // FD_READ, FD_CLOSE: re-enabled by a receive
     ssize_t r = recvfrom(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 3, (struct sockaddr *)&a, &n);
+    if (r >= 0 || errno != EWOULDBLOCK) { static int k; if (k < 200) { k++; char h[64] = "?"; net_addr_str(&a, h, sizeof h); NT("[net] recvfrom(%d) -> %zd from %s%s\n", sfd(A0), r, h, r < 0 ? strerror(errno) : ""); } }
     if (r < 0) { RET(fail()); return; }
     addr_out(&a, AN(4), AN(5));
     RET((uint32_t)r);
@@ -199,6 +208,8 @@ void I_wsock32_dll__20(CPU *c) {
     struct sockaddr_storage a; socklen_t n = addr_in(AN(4), (uint32_t)AN(5), &a);
     ssize_t r = n ? sendto(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 1, (struct sockaddr *)&a, n)
                   : send(sfd(A0), PTR(A1), (size_t)(int32_t)A2, (int)A3 & 1);
+    if (r < 0 && errno == EWOULDBLOCK) ws_write_blocked(sfd(A0));
+    { static int k; if (k < 200) { k++; char h[64] = "?"; if (n) net_addr_str(&a, h, sizeof h); NT("[net] sendto(%d, %d bytes, %s) -> %zd%s%s\n", sfd(A0), (int)A2, h, r, r < 0 ? " " : "", r < 0 ? strerror(errno) : ""); } }
     RET(r < 0 ? fail() : (uint32_t)r);
 }
 // #18 select(nfds, read, write, except, timeval*): fd_set = { u_int fd_count; SOCKET fd_array[64] } (x64: array at +8)
@@ -229,6 +240,7 @@ void I_wsock32_dll__18(CPU *c) {
 // #1 accept(s, addr, *len) / #13 listen(s, backlog) / #22 shutdown(s, how): SD_RECEIVE 0, SD_SEND 1, SD_BOTH 2 match
 void I_wsock32_dll__1(CPU *c) {
     struct sockaddr_storage a; socklen_t n = sizeof a;
+    ws_rearm(sfd(A0), 8);   // FD_ACCEPT
     int fd = accept(sfd(A0), (struct sockaddr *)&a, &n);
     if (fd < 0) { set_last_error(wsa_err(errno)); RET(INVALID_SOCKET); return; }
     int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -317,6 +329,119 @@ void I_iphlpapi_dll_GetAdaptersInfo(CPU *c) {
         inet_ntop(AF_INET, &a[k].mask, PTR(p + 440 + 24), 16);
         snprintf(PTR(p + 488 + 8), 16, "0.0.0.0");
     }
+    RET(0);
+}
+
+// iphlpapi GetAdaptersAddresses(family, flags, reserved, IP_ADAPTER_ADDRESSES *, *size): the interfaces that are up,
+// with their IPv4 and IPv6 addresses. Win64 IP_ADAPTER_ADDRESSES_LH (448 bytes): Length +0, IfIndex +4, Next +8,
+// AdapterName +16, FirstUnicastAddress +24, Anycast +32, Multicast +40, DnsServer +48, DnsSuffix +56,
+// Description +64, FriendlyName +72, PhysicalAddress[8] +80, PhysicalAddressLength +88, Flags +92, Mtu +96,
+// IfType +100, OperStatus +104, Ipv6IfIndex +108, ZoneIndices[16] +112, FirstPrefix +176, TransmitLinkSpeed +184,
+// ReceiveLinkSpeed +192, FirstWinsServer +200, FirstGateway +208, Ipv4Metric +216, Ipv6Metric +220, Luid +224, ...,
+// ConnectionType +268. IP_ADAPTER_UNICAST_ADDRESS_LH (64 bytes): Length +0, Flags +4, Next +8, Address
+// { lpSockaddr +16, iSockaddrLength +24 }, PrefixOrigin +32, SuffixOrigin +36, DadState +40, ValidLifetime +44,
+// PreferredLifetime +48, LeaseLifetime +52, OnLinkPrefixLength +56.
+#define AA_SIZE 448
+#define UA_SIZE 64
+static uint8_t prefix_len(const struct sockaddr *m) {
+    if (!m) return 0;
+    const uint8_t *b; size_t n;
+    if (m->sa_family == AF_INET) { b = (const uint8_t *)&((const struct sockaddr_in *)m)->sin_addr; n = 4; }
+    else if (m->sa_family == AF_INET6) { b = (const uint8_t *)&((const struct sockaddr_in6 *)m)->sin6_addr; n = 16; }
+    else return 0;
+    uint8_t l = 0; for (size_t i = 0; i < n; i++) l += (uint8_t)__builtin_popcount(b[i]);
+    return l;
+}
+void I_iphlpapi_dll_GetAdaptersAddresses(CPU *c) {
+    uint32_t fam = (uint32_t)A0; uint64_t buf = A3, psize = AN(4);
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs)) { RET(232); return; }   // ERROR_NO_DATA
+    // interfaces (by name, in order) that are up and have an address of the family asked for
+    char names[32][IFNAMSIZ]; int nn = 0, nu[32] = { 0 };
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || !(i->ifa_flags & IFF_UP)) continue;
+        int f = i->ifa_addr->sa_family;
+        if (!((f == AF_INET && (fam == 0 || fam == AF_INET)) || (f == AF_INET6 && (fam == 0 || fam == W_AF_INET6)))) continue;
+        int k = 0; while (k < nn && strcmp(names[k], i->ifa_name)) k++;
+        if (k == nn) { if (nn == 32) continue; snprintf(names[nn++], IFNAMSIZ, "%s", i->ifa_name); }
+        nu[k]++;
+    }
+    size_t need = 0;
+    for (int k = 0; k < nn; k++) need += AA_SIZE + 64 + 3 * 2 * 64 + (size_t)nu[k] * 2 * (UA_SIZE + 32);
+    if (!nn) { freeifaddrs(ifs); RET(232); return; }
+    uint32_t have = psize ? rd32(psize) : 0;
+    if (psize) wr32(psize, (uint32_t)need);
+    if (!buf || have < need) { freeifaddrs(ifs); RET(111); return; }   // ERROR_BUFFER_OVERFLOW
+    memset(PTR(buf), 0, need);
+    uint64_t at = buf, prev = 0;
+    for (int k = 0; k < nn; k++) {
+        uint64_t a = at; at += AA_SIZE;
+        if (prev) wr64(prev + 8, a);
+        prev = a;
+        unsigned idx = if_nametoindex(names[k]);
+        int loop = 0, mtu = 1500; uint8_t mac[6]; int hasmac = 0;
+        for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+            if (strcmp(i->ifa_name, names[k])) continue;
+            if (i->ifa_flags & IFF_LOOPBACK) loop = 1;
+            if (i->ifa_addr && i->ifa_addr->sa_family == AF_LINK) {
+                struct sockaddr_dl *dl = (struct sockaddr_dl *)i->ifa_addr;
+                if (dl->sdl_alen == 6) { memcpy(mac, LLADDR(dl), 6); hasmac = 1; }
+                if (i->ifa_data) mtu = (int)((struct if_data *)i->ifa_data)->ifi_mtu;
+            }
+        }
+        wr32(a, AA_SIZE); wr32(a + 4, idx);
+        // strings: AdapterName (a GUID, as Windows names adapters), DnsSuffix, Description, FriendlyName
+        uint64_t name = at; at += 64;
+        snprintf(PTR(name), 64, "{%08X-0000-0000-0000-%012X}", idx, idx);
+        wr64(a + 16, name);
+        uint64_t ws[3]; const char *txt[3] = { "", names[k], names[k] };
+        for (int t = 0; t < 3; t++) {
+            ws[t] = at; at += 2 * 64;
+            for (int q = 0; txt[t][q] && q < 63; q++) wr16(ws[t] + 2 * (uint64_t)q, (uint8_t)txt[t][q]);
+        }
+        wr64(a + 56, ws[0]); wr64(a + 64, ws[1]); wr64(a + 72, ws[2]);
+        if (hasmac && !loop) { memcpy(PTR(a + 80), mac, 6); wr32(a + 88, 6); }
+        wr32(a + 92, 0x20 | 0x100 | 0x80);   // IP_ADAPTER_DHCP_ENABLED-ish defaults: IPV4_ENABLED 0x80, IPV6_ENABLED 0x100
+        wr32(a + 96, (uint32_t)mtu);
+        wr32(a + 100, loop ? 24 : 6);        // IF_TYPE_SOFTWARE_LOOPBACK / IF_TYPE_ETHERNET_CSMACD
+        wr32(a + 104, 1);                    // IfOperStatusUp
+        wr32(a + 108, idx);
+        wr64(a + 184, 1000000000ull); wr64(a + 192, 1000000000ull);
+        wr32(a + 216, loop ? 75 : 25); wr32(a + 220, loop ? 75 : 25);
+        wr64(a + 224, ((uint64_t)(loop ? 24 : 6) << 48) | idx);   // NET_LUID: IfType in the top 16 bits
+        wr32(a + 268, 1);                    // NET_IF_CONNECTION_DEDICATED
+        uint64_t uprev = 0, pprev = 0;
+        for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+            if (strcmp(i->ifa_name, names[k]) || !i->ifa_addr) continue;
+            int f = i->ifa_addr->sa_family;
+            if (!((f == AF_INET && (fam == 0 || fam == AF_INET)) || (f == AF_INET6 && (fam == 0 || fam == W_AF_INET6)))) continue;
+            uint64_t u = at; at += UA_SIZE; uint64_t sa = at; at += 32;
+            struct sockaddr_storage ss; memset(&ss, 0, sizeof ss);
+            memcpy(&ss, i->ifa_addr, f == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+            uint32_t len = 32; addr_out(&ss, sa, G(&len));
+            wr32(u, UA_SIZE); wr32(u + 4, 0);
+            wr64(u + 16, sa); wr32(u + 24, len);
+            wr32(u + 32, 4); wr32(u + 36, 4); wr32(u + 40, 4);   // PrefixOrigin/SuffixOrigin Dhcp-like, IpDadStatePreferred
+            wr32(u + 44, 0xFFFFFFFFu); wr32(u + 48, 0xFFFFFFFFu); wr32(u + 52, 0xFFFFFFFFu);
+            wr8(u + 56, prefix_len(i->ifa_netmask));
+            if (uprev) wr64(uprev + 8, u); else wr64(a + 24, u);
+            uprev = u;
+            // its on-link prefix (IP_ADAPTER_PREFIX: Length +0, Flags +4, Next +8, Address +16/+24, PrefixLength +32)
+            uint8_t pl = prefix_len(i->ifa_netmask);
+            uint64_t px = at; at += UA_SIZE; uint64_t psa = at; at += 32;
+            struct sockaddr_storage ps = ss;
+            uint8_t *ab = f == AF_INET ? (uint8_t *)&((struct sockaddr_in *)&ps)->sin_addr : (uint8_t *)&((struct sockaddr_in6 *)&ps)->sin6_addr;
+            int nb = f == AF_INET ? 4 : 16;
+            for (int b = 0; b < nb; b++) { int keep = pl - 8 * b; ab[b] &= keep >= 8 ? 0xFF : keep <= 0 ? 0 : (uint8_t)(0xFF << (8 - keep)); }
+            if (f == AF_INET6) ((struct sockaddr_in6 *)&ps)->sin6_scope_id = 0;
+            uint32_t plen2 = 32; addr_out(&ps, psa, G(&plen2));
+            wr32(px, 40); wr64(px + 16, psa); wr32(px + 24, plen2); wr32(px + 32, pl);
+            if (pprev) wr64(pprev + 8, px); else wr64(a + 176, px);
+            pprev = px;
+        }
+        NT("[net] adapter %s (index %u, type %u)\n", names[k], idx, rd32(a + 100));
+    }
+    freeifaddrs(ifs);
     RET(0);
 }
 
@@ -424,7 +549,7 @@ void I_ws2_32_dll_inet_pton(CPU *c) {
 #include <pthread.h>
 #include "handles.h"
 enum { FD_READ_ = 1, FD_WRITE_ = 2, FD_OOB_ = 4, FD_ACCEPT_ = 8, FD_CONNECT_ = 16, FD_CLOSE_ = 32 };
-typedef struct { int fd; uint64_t event; uint32_t mask, pending, armed; int connecting, closed; uint32_t err[10]; } WsSel;
+typedef struct { int fd; uint64_t event; uint32_t mask, pending, armed; int connecting, closed, dgram; uint32_t err[10]; } WsSel;
 static WsSel ws_sel[256]; static int ws_nsel;
 static pthread_mutex_t ws_mu = PTHREAD_MUTEX_INITIALIZER;
 static int ws_wake[2] = { -1, -1 };
@@ -434,9 +559,10 @@ static void ws_set_event(uint64_t h) {
     h_lock(); HObj *o = h_get(h); if (o) { o->state = 1; h_wake(o); } h_unlock();
 }
 static void ws_report(WsSel *s, uint32_t bits) {   // ws_mu held
-    bits &= s->mask & ~s->pending;
+    bits &= s->mask & s->armed;
     if (!bits) return;
     s->pending |= bits;
+    s->armed &= ~bits;   // reported once, until the call that re-enables it (recv for FD_READ, ...)
     ws_set_event(s->event);
 }
 static void *ws_poller(void *arg) {
@@ -447,7 +573,7 @@ static void *ws_poller(void *arg) {
         pf[n].fd = ws_wake[0]; pf[n].events = POLLIN; idx[n++] = -1;
         for (int i = 0; i < ws_nsel; i++) {
             WsSel *s = &ws_sel[i]; short ev = 0;
-            uint32_t want = s->mask & s->armed & ~s->pending;
+            uint32_t want = s->mask & s->armed;
             if (s->closed) continue;
             if (s->connecting) { if (want & (FD_CONNECT_ | FD_WRITE_ | FD_CLOSE_)) ev |= POLLOUT; }
             else {
@@ -471,16 +597,21 @@ static void *ws_poller(void *arg) {
                 if (!e) s->armed &= ~FD_WRITE_;   // reported once; again after a blocked send
                 continue;
             }
-            if (pf[k].revents & (POLLIN | POLLHUP | POLLERR)) {
+            if (s->dgram && pf[k].revents & (POLLIN | POLLERR)) {
+                // a datagram socket never closes: a datagram, or an error (an ICMP report from an earlier send)
+                // that the next recvfrom returns, is FD_READ
+                ws_report(s, FD_READ_);
+            } else if (!s->dgram && pf[k].revents & (POLLIN | POLLHUP | POLLERR)) {
                 char b; ssize_t r = recv(s->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
                 if (s->mask & FD_ACCEPT_ && r < 0 && errno == ENOTCONN) ws_report(s, FD_ACCEPT_);
                 else if (r > 0) ws_report(s, FD_READ_);
                 else if (r == 0 || (r < 0 && errno != EWOULDBLOCK)) {
                     s->err[5] = r == 0 ? 0 : wsa_err(errno);
                     s->closed = 1; ws_report(s, FD_CLOSE_);
+                    NT("[net] socket %d closed (%s)\n", s->fd, r == 0 ? "by the peer" : strerror(errno));
                 }
             }
-            if (pf[k].revents & POLLOUT && s->armed & FD_WRITE_) { s->armed &= ~FD_WRITE_; ws_report(s, FD_WRITE_); }
+            if (pf[k].revents & POLLOUT) ws_report(s, FD_WRITE_);
         }
         pthread_mutex_unlock(&ws_mu);
     }
@@ -502,6 +633,11 @@ static void ws_connecting(int fd) {
     WsSel *s = ws_find(fd); if (s) { s->connecting = 1; s->closed = 0; s->armed |= FD_CONNECT_ | FD_WRITE_ | FD_CLOSE_; }
     pthread_mutex_unlock(&ws_mu); if (s) ws_poke();
 }
+static void ws_rearm(int fd, uint32_t bits) {
+    pthread_mutex_lock(&ws_mu);
+    WsSel *s = ws_find(fd); if (s) s->armed |= bits;
+    pthread_mutex_unlock(&ws_mu); if (s) ws_poke();
+}
 static void ws_write_blocked(int fd) {
     pthread_mutex_lock(&ws_mu);
     WsSel *s = ws_find(fd); if (s) s->armed |= FD_WRITE_;
@@ -517,9 +653,16 @@ void I_ws2_32_dll_WSAEventSelect(CPU *c) {
     if (!s) {
         if (ws_nsel == 256) { pthread_mutex_unlock(&ws_mu); set_last_error(10024); RET(SOCKET_ERROR); return; }
         s = &ws_sel[ws_nsel++]; memset(s, 0, sizeof *s); s->fd = fd;
+        int ty = 0; socklen_t tl = sizeof ty; getsockopt(fd, SOL_SOCKET, SO_TYPE, &ty, &tl); s->dgram = ty == SOCK_DGRAM;
         // an already connected socket is writable now
         struct sockaddr_storage a; socklen_t l = sizeof a;
-        s->armed = FD_READ_ | FD_CLOSE_ | FD_ACCEPT_ | FD_OOB_ | (getpeername(fd, (struct sockaddr *)&a, &l) == 0 ? FD_WRITE_ : 0);
+        s->armed = FD_READ_ | FD_CLOSE_ | FD_ACCEPT_ | FD_OOB_ | (s->dgram || getpeername(fd, (struct sockaddr *)&a, &l) == 0 ? FD_WRITE_ : 0);
+    }
+    else {
+        // selecting again re-enables the level conditions, and an event not collected yet signals the (possibly
+        // reset) event object again
+        if (!s->closed) s->armed |= FD_READ_ | FD_CLOSE_ | FD_ACCEPT_ | FD_OOB_;
+        if (s->pending & mask) ws_set_event(A1);
     }
     s->event = A1; s->mask = mask;
     pthread_mutex_unlock(&ws_mu);

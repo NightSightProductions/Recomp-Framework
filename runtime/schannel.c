@@ -272,7 +272,7 @@ static void DecryptMessage(CPU *c) {
     else if (st != noErr && st != errSSLWouldBlock) { free(plain); RET(st_error(x, "decrypt", st)); return; }
     if (x->out_len) { rt_log("[schannel] %s: post-handshake reply of %zu bytes dropped\n", x->host, x->out_len); x->out_len = 0; }
     TR("[schannel] %s: decrypt record of %ld bytes (type %u) -> %zu bytes, status %d, %zu left over\n", x->host, rl, p[0], plen, (int)st, n - (size_t)rl);
-    if (plen && trace > 0) { char t[121]; size_t k = plen < 120 ? plen : 120; for (size_t i = 0; i < k; i++) t[i] = plain[i] >= 32 && plain[i] < 127 ? (char)plain[i] : '.'; t[k] = 0; rt_log("[schannel]   \"%s\"\n", t); }
+    if (plen && trace > 0) { char t[4097]; size_t k = plen < 4096 ? plen : 4096; for (size_t i = 0; i < k; i++) t[i] = plain[i] >= 32 && plain[i] < 127 ? (char)plain[i] : '.'; t[k] = 0; rt_log("[schannel]   \"%s\"\n", t); }
     memcpy(p + HDR, plain, plen); free(plain);
     uint32_t nb = sb_count(desc);
     uint64_t pv = G(p);
