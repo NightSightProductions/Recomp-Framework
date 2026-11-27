@@ -1,3 +1,4 @@
+#include <mach/mach_time.h>
 // libc shims: guest (i386 cdecl, 32-bit pointers) -> host arm64 libc.
 // Each shim reads its arguments with ARG(slot) (slot 0 = first argument;
 // a double occupies two slots) and returns in C.eax / C.edx / x87 ST(0).
@@ -19,10 +20,13 @@ void rt_set_data_import(const char *name, uint32_t guest_addr);
 
 // ---------- guest FILE handles ----------
 // A guest FILE* is a 16-byte guest block; word 0 = index into host table.
-#define NFILES 64
+#define NFILES 4096   // guest FILE table; UE3 keeps many package files open while streaming
 static FILE *hfiles[NFILES];
 static uint32_t gfile_new(FILE *h) {
     if (!h) return 0;
+    { static int warned, high; int used = 0; for (int i = 0; i < NFILES; i++) used += hfiles[i] != NULL;
+      if (used >= NFILES - 1 && !warned++) fprintf(stderr, "[file] guest FILE table full (%d)\n", NFILES);
+      if (used > high && (used % 32 == 0)) { high = used; fprintf(stderr, "[file] open guest FILEs high-water: %d\n", used); } }
     for (int i = 0; i < NFILES; i++) if (!hfiles[i]) {
         hfiles[i] = h; uint32_t g = gmalloc(16); wr32(g, (uint32_t)i); wr32(g + 4, 0x46494C45); return g;
     }
@@ -49,6 +53,23 @@ static void gfile_free(uint32_t g) { hfiles[rd32(g)] = NULL; wr32(g + 4, GFILE_C
 static uint32_t g_errno, g_stdin, g_stdout, g_stderr, g_tm, g_lconv;
 static void sync_errno(void) { wr32(g_errno, (uint32_t)errno); }
 
+// ---- added for BioShock Infinite: guest wchar_t (32-bit) string -> UTF-8, for %ls / %S ----
+static void w2u8(uint32_t p, char *o, size_t cap) {
+    size_t n = 0;
+    for (;; p += 4) {
+        uint32_t ch = rd32(p);
+        if (!ch) break;
+        char t[4]; int l;
+        if (ch < 0x80) { t[0] = (char)ch; l = 1; }
+        else if (ch < 0x800) { t[0] = (char)(0xC0 | (ch >> 6)); t[1] = (char)(0x80 | (ch & 63)); l = 2; }
+        else if (ch < 0x10000) { t[0] = (char)(0xE0 | (ch >> 12)); t[1] = (char)(0x80 | ((ch >> 6) & 63)); t[2] = (char)(0x80 | (ch & 63)); l = 3; }
+        else { t[0] = (char)(0xF0 | (ch >> 18)); t[1] = (char)(0x80 | ((ch >> 12) & 63)); t[2] = (char)(0x80 | ((ch >> 6) & 63)); t[3] = (char)(0x80 | (ch & 63)); l = 4; }
+        if (n + l + 1 > cap) break;
+        memcpy(o + n, t, l); n += l;
+    }
+    o[n] = 0;
+}
+// ---- end additions ----
 // ---------- printf-family formatting with guest varargs ----------
 // va = guest address of the first variadic argument.
 static int gformat(char *out, size_t cap, const char *fmt, uint32_t va) {
@@ -95,8 +116,13 @@ static int gformat(char *out, size_t cap, const char *fmt, uint32_t va) {
             if (L) { fprintf(stderr, "[rt] long double printf unsupported\n"); abort(); }
             spec[k++] = cv; spec[k] = 0; EMIT(rdd(va)); va += 8;
             break;
-        case 's':
-            spec[k++] = 's'; spec[k] = 0; { uint32_t p = rd32(va); va += 4; EMIT(p ? S(p) : "(null)"); }
+        case 's': case 'S':
+            spec[k++] = 's'; spec[k] = 0;
+            {   // %ls / %S take a wide string; plain %s takes a narrow one
+                uint32_t p = rd32(va); va += 4;
+                if (cv == 'S' || ll == 1) { char wb[4096]; if (p) w2u8(p, wb, sizeof wb); else strcpy(wb, "(null)"); EMIT(wb); }
+                else EMIT(p ? S(p) : "(null)");
+            }
             break;
         case 'p':
             strcpy(spec + k, "#x"); EMIT(rd32(va)); va += 4;
@@ -165,9 +191,25 @@ void I____error(CPU *c)    { RET(g_errno); }
 void I__strerror_UNIX2003(CPU *c) { static uint32_t g; if (g) gfree(g); g = gstrdup(strerror((int)ARG(0))); RET(g); }
 
 // ---------- heap ----------
-void I__malloc(CPU *c)  { RET(gmalloc(ARG(0))); }
-void I__calloc(CPU *c)  { uint32_t n = ARG(0) * ARG(1), p = gmalloc(n); memset(M + p, 0, n); RET(p); }
-void I__realloc(CPU *c) { RET(grealloc(ARG(0), ARG(1))); }
+// Debug aid: report who asked for an absurd allocation (≥ 1 GiB) before the heap allocator aborts.
+static void big_check(CPU *c, uint32_t n, const char *what) {
+    if (n < 0x40000000u) return;
+    fprintf(stderr, "[rt] huge %s(%u = 0x%x) from %s (0x%x), caller %s\n  stack:", what, n, n,
+            rt_func_name(c->fn), c->fn, rt_func_name(rd32(c->esp)));
+    for (uint32_t f = c->ebp, k = 0; f > 0x1000 && k < 10; f = rd32(f), k++) fprintf(stderr, "\n    %s", rt_func_name(rd32(f + 4)));
+    fprintf(stderr, "\n");
+    uint32_t a1 = rd32(c->ebp + 8), a2 = rd32(c->ebp + 12);   // ⚠ assumes the caller's frame is still the current one
+    fprintf(stderr, "  frame args: 0x%x 0x%x\n  arg2 words:", a1, a2);
+    for (int i = 0; a2 > 0x1000 && i < 20; i++) fprintf(stderr, " %08x", rd32(a2 + 4 * i));
+    fprintf(stderr, "\n");
+    uint32_t f1 = rd32(c->ebp), ad = f1 > 0x1000 ? rd32(f1 + 8) : 0; // ⚠ guess: the first argument of the caller's caller is the object the size came from
+    fprintf(stderr, "  adapter 0x%x words:", ad);
+    for (int i = 0; ad > 0x1000 && i < 16; i++) fprintf(stderr, " %08x", rd32(ad + 4 * i));
+    fprintf(stderr, "\n");
+}
+void I__malloc(CPU *c)  { big_check(c, ARG(0), "malloc"); RET(gmalloc(ARG(0))); }
+void I__calloc(CPU *c)  { uint32_t n = ARG(0) * ARG(1); big_check(c, n, "calloc"); uint32_t p = gmalloc(n); memset(M + p, 0, n); RET(p); }
+void I__realloc(CPU *c) { big_check(c, ARG(1), "realloc"); RET(grealloc(ARG(0), ARG(1))); }
 void I__free(CPU *c)    { gfree(ARG(0)); }
 
 // ---------- setjmp/longjmp, process ----------
@@ -186,10 +228,16 @@ void I__localeconv(CPU *c) { RET(g_lconv); }
 
 // ---------- math (float args are 4-byte slots, doubles 8-byte) ----------
 #define F1(name, fn) void I__##name(CPU *c) { RETF(fn(ARGF(0))); }
-F1(floorf, floorf) F1(ceilf, ceilf) F1(sinf, sinf) F1(cosf, cosf) F1(tanf, tanf)
-F1(asinf, asinf) F1(acosf, acosf) F1(atanf, atanf) F1(sinhf, sinhf) F1(coshf, coshf)
-F1(tanhf, tanhf) F1(expf, expf) F1(logf, logf) F1(log10f, log10f)
-void I__pow(CPU *c)   { RETF(pow(ARGD(0), ARGD(2))); }
+F1(floorf, floorf)
+F1(ceilf, ceilf)
+F1(sinf, sinf)
+F1(cosf, cosf)
+F1(tanf, tanf)
+F1(asinf, asinf)
+F1(acosf, acosf) F1(atanf, atanf) F1(sinhf, sinhf) F1(coshf, coshf) F1(tanhf, tanhf) F1(expf, expf) F1(logf, logf)
+    F1(log10f, log10f) void I__pow(CPU *c) {
+    RETF(pow(ARGD(0), ARGD(2)));
+}
 void I__fmod(CPU *c)  { RETF(fmod(ARGD(0), ARGD(2))); }
 void I__atan2(CPU *c) { RETF(atan2(ARGD(0), ARGD(2))); }
 void I__ldexp(CPU *c) { RETF(ldexp(ARGD(0), (int)ARG(2))); }
@@ -217,7 +265,8 @@ void I__mktime_UNIX2003(CPU *c) { struct tm t; tm_from_guest(ARG(0), &t); time_t
 void I__strftime_UNIX2003(CPU *c) { struct tm t; tm_from_guest(ARG(3), &t); RET(strftime(S(ARG(0)), ARG(1), S(ARG(2)), &t)); }
 
 // ---------- stdio ----------
-void I__fopen(CPU *c) { FILE *f = fopen(S(ARG(0)), S(ARG(1))); sync_errno(); if (getenv("RT32_TRACE_FILES")) fprintf(stderr, "[file] fopen %s -> %d\n", S(ARG(0)), f != NULL); RET(gfile_new(f)); }
+void I__fopen(CPU *c) { FILE *f = fopen(S(ARG(0)), S(ARG(1))); sync_errno();
+    if (!f && errno != ENOENT) fprintf(stderr, "[file] fopen %s failed: %s\n", S(ARG(0)), strerror(errno)); if (getenv("RT32_TRACE_FILES")) fprintf(stderr, "[file] fopen %s -> %d\n", S(ARG(0)), f != NULL); RET(gfile_new(f)); }
 void I__fdopen(CPU *c) { RET(gfile_new(fdopen((int)ARG(0), S(ARG(1))))); }
 void I__tmpfile(CPU *c) { RET(gfile_new(tmpfile())); }
 void I__fclose(CPU *c) {
@@ -225,7 +274,10 @@ void I__fclose(CPU *c) {
     if (!g || rd32(g + 4) != GFILE_OPEN) { HF(g); RET(-1); return; }   // double close: fail like libc (EOF)
     int r = fclose(hfiles[rd32(g)]); gfile_free(g); RET(r);
 }
-void I__fread(CPU *c) { MC(ARG(0), ARG(1) * ARG(2)); RET(fread(S(ARG(0)), ARG(1), ARG(2), HF(ARG(3)))); }
+void rt_touch_write(uint32_t g, uint32_t n);
+extern volatile uint64_t rt_hitch_io_ticks, rt_hitch_io_bytes;
+void I__fread(CPU *c) { MC(ARG(0), ARG(1) * ARG(2)); rt_touch_write(ARG(0), ARG(1) * ARG(2)); uint64_t t0 = mach_absolute_time();
+    size_t r = fread(S(ARG(0)), ARG(1), ARG(2), HF(ARG(3))); rt_hitch_io_ticks += mach_absolute_time() - t0; rt_hitch_io_bytes += (uint64_t)r * ARG(1); RET(r); }
 void I__fwrite_UNIX2003(CPU *c) { RET(fwrite(S(ARG(0)), ARG(1), ARG(2), HF(ARG(3)))); }
 void I__fputs_UNIX2003(CPU *c) { RET(fputs(S(ARG(0)), HF(ARG(1)))); }
 void I__fputc(CPU *c) { RET(fputc((int)ARG(0), HF(ARG(1)))); }

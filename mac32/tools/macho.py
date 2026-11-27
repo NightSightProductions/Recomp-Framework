@@ -55,6 +55,13 @@ class Image:
                 v = int(p[0], 16)
                 if lo <= v < hi and v not in fn:
                     fn[v] = p[2]
+        import os
+        extra = os.environ.get("RECOMP_EXTRA_STARTS")
+        if extra:   # extra function starts (hex per line), e.g. direct call targets in stripped regions
+            for ln in open(extra):
+                if ln.strip():
+                    v = int(ln.split()[0], 16)
+                    if lo <= v < hi and v not in fn: fn[v] = "sub_%x" % v
         self.func_addrs = sorted(fn)
         self.func_names = fn
         self.name_to_addr = {v: k for k, v in fn.items()}

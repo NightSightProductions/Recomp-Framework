@@ -196,6 +196,7 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
 |---|---|
 | `mac32/tools/recomp32.py` | The translator: i386 Mach-O → C (`recomp32.py BINARY LO HI OUTDIR [--hle FILE]`) |
 | `mac32/tools/macho.py` | Mach-O reader: segments, sections, function symbols, import stubs and pointers |
+| `mac32/tools/eh32.py` | Reads `__eh_frame` and `__gcc_except_tab`, so translated code can throw and catch C++ exceptions |
 | `mac32/tools/glgen.py` | Generates the OpenGL entry points from a signature table |
 | `mac32/runtime/` | The 32-bit runtime and the Cocoa/OpenGL host |
 | `mac32/template/`, `mac32/mac32.mk` | Starting point and build rules for a game project |
@@ -208,22 +209,34 @@ A separate translator and runtime for i386 Mach-O executables. Games link agains
 
   | Area | |
   |---|---|
-  | C library, threads, and the C++ runtime of GCC 4.2's libstdc++ (RTTI and `dynamic_cast`, iostreams) | `libc2.c`, `shims.c`, `sys.c`, `cxx.c` |
-  | CoreFoundation, CoreGraphics display modes and preferences | `cf.c` |
+  | C library, threads, and the C++ runtime of GCC 4.2's libstdc++ (RTTI and `dynamic_cast`, iostreams, copy-on-write strings, exceptions) | `libc2.c`, `shims.c`, `sys.c`, `cxx.c`, `cxxstr.c`, `eh.c` |
+  | CoreFoundation, CoreGraphics display modes and preferences, Carbon events, IOKit queries | `cf.c` |
+  | Objective-C 1.0 message dispatch for the little Cocoa a game's wrapper code uses | `objc.c` |
+  | Bink movies, decoded by FFmpeg with `make FFMPEG=1` (black frames otherwise) | `bink.c` |
   | OpenGL (legacy profile on CGL) with the engine's viewport mapped onto Retina drawables | `gl.c` + generated entry points |
   | FMOD Ex on CoreAudio, Ogg Vorbis through stb_vorbis | `fmod.c`, `vorbis.c` |
   | Steamworks of the period, offline (stats and achievements stored locally) | `steam.c` |
-  | The app host: window, OpenGL view, input, fullscreen, screenshots, scripted input | `host.m` |
+  | Game controllers through the GameController framework, in XInput's layout | `pad.m` |
+  | The app host: window, OpenGL view, input, fullscreen, screenshots, scripted input, MetalFX upscaling, a statistics overlay, frame pacing | `host.m` |
 
 - **Porting.** The host drives the game through a few hooks the game project implements (`mac32/runtime/game32.h`):
   start, frame, window size, quit, and input. They usually call the engine's own C entry points: the ones the
   original app's Cocoa code called. Engine functions that talked to the old OS are replaced natively through
-  `--hle` (`address name` per line, implemented as `H_<name>`).
+  `--hle` (`address name` per line, implemented as `H_<name>`). A project can name the one executable it was made
+  for (`exe_sha256` in `rt32_game`); the host then refuses other builds with a clear message.
+- **Opt-in behaviour.** Off by default, so existing ports keep working as they did: `-DRT_TSO=1` (x86 store ordering
+  for lock-free guest code), and in `rt32_game` `.gl_fast_buffers` (mapped buffers alias the driver's memory, dirty-page
+  uploads, orphaning), `.gl_invariant_position`, `.metalfx` and `.cf_release` (real `CFRelease`).
 - **Diagnostics.**
   - `RT32_SHOT`, `RT32_EXIT_AFTER`, `RT32_INPUT`: screenshots, timed exits and scripted input for automated runs.
   - `RT32_STRICT`: abort on unimplemented imports.
   - `RT32_WATCH`, `RT32_MEMWATCH`, and `-DMEMCHECK` builds: watch guest functions and guest memory writes.
   - `RT32_TRACE_GL`, `RT32_TRACE_FMOD`, `RT32_TRACE_FILES`: subsystem traces.
+  - `RT32_HUD=1`: overlay with frame rate, frame time, GPU time and memory (F12 toggles it while `RT32_HUD` is set).
+    With `.metalfx = 1` in `rt32_game`, F9 switches MetalFX upscaling on and off (`RT32_NO_METALFX=1` disables it).
+  - `[frame]`, `[hitch+]`, `[slowcall]`, `[shader]` log lines: where frame time goes, with GPU time from a timer
+    query. `RT32_PACE=display` paces frames from the display (variable refresh), `RT32_WARM=1` draws once with
+    each shader program when it is validated.
 
 ## Diagnostics (Windows x86-64)
 

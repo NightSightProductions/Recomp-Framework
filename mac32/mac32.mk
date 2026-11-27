@@ -38,8 +38,18 @@ $(BUILD)/gl_gen.c: $(M32)/tools/glgen.py
 
 GEN_SRC = $(wildcard $(GEN_DIR)/code_*.c) $(GEN_DIR)/tables.c
 GEN_OBJ = $(patsubst %.c,$(BUILD)/%.o,$(GEN_SRC))
-M32_RT  = rt.c shims.c sys.c cxx.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c
-RT_OBJ  = $(patsubst %.c,$(BUILD)/m32/%.o,$(M32_RT)) $(BUILD)/m32/host.o $(BUILD)/gl_gen.o
+M32_RT  = rt.c shims.c sys.c cxx.c cxxstr.c libc2.c cf.c steam.c fmod.c vorbis.c gl.c objc.c eh.c bink.c
+# Bink movies: with FFMPEG=1 they decode through FFmpeg (pkg-config libavcodec libavformat libavutil); otherwise they
+# play as black frames. Opt-in: the app then links FFmpeg's dylibs, which `make bundle` does not copy, so a project that
+# ships with FFMPEG=1 has to bundle them (and check FFmpeg's license for the build it uses).
+FFMPEG ?= 0
+FFMPEG_CFLAGS :=
+FFMPEG_LIBS   :=
+ifeq ($(FFMPEG),1)
+FFMPEG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil) -DHAVE_FFMPEG
+FFMPEG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil)
+endif
+RT_OBJ  = $(patsubst %.c,$(BUILD)/m32/%.o,$(M32_RT)) $(BUILD)/m32/host.o $(BUILD)/m32/pad.o $(BUILD)/gl_gen.o
 GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
 M32_HDR = $(wildcard $(M32)/runtime/*.h)
 
@@ -52,7 +62,12 @@ $(BUILD)/m32/vorbis.o: $(M32)/runtime/vorbis.c $(M32_HDR)
 $(BUILD)/m32/%.o: $(M32)/runtime/%.c $(M32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/m32/bink.o: CFLAGS += $(FFMPEG_CFLAGS)
 $(BUILD)/m32/host.o: $(M32)/runtime/host.m $(M32_HDR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
+# game controllers (GameController framework)
+$(BUILD)/m32/pad.o: $(M32)/runtime/pad.m $(M32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 $(BUILD)/gl_gen.o: $(BUILD)/gl_gen.c $(M32_HDR)
@@ -63,10 +78,15 @@ $(BUILD)/game/%.o: %.c $(M32_HDR)
 $(BUILD)/libgame32.a: $(GEN_OBJ)
 	rm -f $@; ar rcs $@ $^
 
-FRAMEWORKS = -framework CoreFoundation -framework ApplicationServices -framework Cocoa -framework OpenGL \
-             -framework AudioToolbox -framework CoreAudio
+# Metal + MetalFX + IOSurface + QuartzCore were added for the MetalFX upscaler in runtime/host.m
+# (IOSurface = memory shared between OpenGL and Metal; QuartzCore = CAMetalLayer). MetalFX exists on macOS 13+ only;
+# with MACOS_MIN below 13 the linker weak-links it and host.m checks @available before using it.
+FRAMEWORKS = -framework CoreFoundation -framework ApplicationServices -framework Cocoa -framework Carbon -framework OpenGL \
+             -framework AudioToolbox -framework CoreAudio \
+             -framework Metal -framework MetalFX -framework IOSurface -framework QuartzCore \
+             -framework GameController
 $(BUILD)/$(APP_NAME): $(BUILD)/libgame32.a $(RT_OBJ) $(GAME_OBJ)
-	$(CC) $(CFLAGS) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/libgame32.a -lz -lc++ $(FRAMEWORKS) -o $@
+	$(CC) $(CFLAGS) $(RT_OBJ) $(GAME_OBJ) $(BUILD)/libgame32.a -lz -lc++ $(FFMPEG_LIBS) $(FRAMEWORKS) -o $@
 app: $(BUILD)/$(APP_NAME)
 # the runtime alone (no translated game): a quick compile check
 runtime: $(RT_OBJ) $(GAME_OBJ)
