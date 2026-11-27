@@ -1362,6 +1362,7 @@ class Translator:
                 k2 = bisect.bisect_right(cov_lo, s0)
                 hi = min(nxt, cov_lo[k2] if k2 < len(cov_lo) else pe.text_hi, pe.code_end(s0))
                 o = s0 - pe.text_lo
+                end = hi; jumps = []
                 for (a, sz, mn, opst) in lite.disasm_lite(code[o:hi - pe.text_lo], s0):
                     if mn == "lea":
                         t = lea_target(a, sz, opst)
@@ -1377,8 +1378,13 @@ class Translator:
                         if (mn == "call" or not (s0 <= t < hi)) and pe.is_code(t) and t not in starts \
                                 and (t in pe.pdata or not inside(t)):
                             new.add(t)
+                        elif mn == "jmp": jumps.append(t)
                     if mn in ("ret", "int3") or (mn == "jmp" and opst.startswith("0x")): 
-                        if mn == "int3": break
+                        if mn == "int3": end = a; break
+                # a jump past the int3 padding that ends this function is a tail call into the next one (thunks
+                # that adjust an argument and jump to a neighbour), not a branch inside it
+                for t in jumps:
+                    if end <= t < hi and pe.is_code(t) and t not in starts and not inside(t): new.add(t)
             if not new: break
             starts |= new
         starts = {s for s in starts if s not in pe.chain_parent}
